@@ -1,12 +1,12 @@
-//! What the app keeps: one file, `lumina.toml`, readable by the member only.
+//! What the relay keeps: one file, `lumina.toml`, readable by the member
+//! only, holding the consent switches. Nothing else: the device id and key
+//! are the app's, in its keychain, and reach the relay through the app's key
+//! callback ([`crate::Builder::key`]).
 //!
-//! It holds the endpoint that issued the token, the device id, the token, the
-//! member Lumina linked it to, and the consent switches. Nothing else. The
-//! token changes on every connect, so every write goes to a temporary file
-//! created with mode 0600 and is renamed over the old one: a crash leaves
-//! either the old token or the new one, never half of either. On Unix the
-//! mode is set at creation, so the token is never readable by anyone else,
-//! not even for a moment.
+//! Every write goes to a temporary file created with mode 0600 and is renamed
+//! over the old one, so a crash leaves the old switches or the new ones,
+//! never half of either. A file an older relay wrote still loads: what it
+//! held besides the switches is ignored, and dropped at the next write.
 
 use std::collections::BTreeMap;
 use std::io::{self, Write};
@@ -67,47 +67,10 @@ impl Class {
 }
 
 /// The file's contents.
-#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Stored {
-    /// The endpoint that issued the token; later connects go there.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub endpoint: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub device_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub token: Option<String>,
-    /// Whose account the device is linked to, as Lumina named the member.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub linked_to: Option<String>,
     #[serde(default)]
     pub consent: Consent,
-}
-
-impl std::fmt::Debug for Stored {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Stored")
-            .field("endpoint", &self.endpoint)
-            .field("device_id", &self.device_id)
-            .field("token", &self.token.as_ref().map(|_| "[redacted]"))
-            .field("linked_to", &self.linked_to)
-            .field("consent", &self.consent)
-            .finish()
-    }
-}
-
-impl Stored {
-    /// The device id and token, when the app is linked.
-    pub fn credentials(&self) -> Option<(&str, &str)> {
-        Some((self.device_id.as_deref()?, self.token.as_deref()?))
-    }
-
-    /// Forget the link, keep the switches.
-    pub fn forget_link(&mut self) {
-        self.endpoint = None;
-        self.device_id = None;
-        self.token = None;
-        self.linked_to = None;
-    }
 }
 
 /// The file at `dir/lumina.toml`.
@@ -125,7 +88,7 @@ impl Store {
         &self.path
     }
 
-    /// The stored state; a missing file is the default (unlinked, all off).
+    /// The stored state; a missing file is the default (all off).
     pub fn load(&self) -> io::Result<Stored> {
         match std::fs::read_to_string(&self.path) {
             Ok(text) => toml::from_str(&text).map_err(|e| {

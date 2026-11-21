@@ -930,6 +930,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "simply-hooks",
  "tempfile",
  "tokio",
  "tokio-tungstenite",

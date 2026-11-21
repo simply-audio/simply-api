@@ -10,11 +10,14 @@ readme = "README.md"
 
 # Deliberately independent of `simply-api`: it serves any rmcp 3.x
 # `ServerHandler`, so an app can adopt it before it uses simply-api.
+# `simply-hooks` brings the device link and its signing, which the hello
+# reuses; it is no heavier than this crate (ring, rustls, tokio).
 [dependencies]
 futures = "0.3"
 rmcp = { version = "3.1.4", default-features = false, features = ["server"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+simply-hooks = { workspace = true }
 tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros"] }
 # rustls with ring and webpki roots: the TLS stack is built in-crate, so no
 # process-wide crypto provider has to be installed by the app.

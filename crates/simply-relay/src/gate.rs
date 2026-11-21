@@ -8,6 +8,11 @@
 //! resources and the rest answer "method not found", whatever the app's
 //! handler offers on its own transports.
 //!
+//! Every listed tool carries its class, stamped by the relay over whatever
+//! the app's handler said: `annotations.readOnlyHint` (true only for
+//! read-only tools) and `_meta["lumina/class"]` (`read_only` or the action
+//! class's name), so Lumina knows from `tools/list` which tools only read.
+//!
 //! A refusal is a JSON-RPC error with code `-32602` (what MCP answers for a
 //! tool it does not have) and `data` `{"refused": "switched_off" |
 //! "not_exposed", "class": …}`, so Lumina can audit it as refused rather than
@@ -27,7 +32,7 @@ use serde_json::{json, Value};
 use crate::calls::{now_rfc3339, CallRecord, Verdict};
 use crate::diag;
 use crate::store::Class;
-use crate::wire::PURPOSE_META_KEY;
+use crate::wire::{CLASS_META_KEY, PURPOSE_META_KEY};
 use crate::Shared;
 
 /// How long `lumina_report` gives each of the app's own checks.
@@ -130,6 +135,16 @@ impl<S: ServerHandler> Gated<S> {
     }
 }
 
+/// Stamp `class` on `tool`: `readOnlyHint` and `_meta["lumina/class"]`.
+fn stamp(tool: &mut Tool, class: &Class) {
+    let mut annotations = tool.annotations.take().unwrap_or_default();
+    annotations.read_only_hint = Some(*class == Class::ReadOnly);
+    tool.annotations = Some(annotations);
+    let mut meta = tool.meta.take().unwrap_or_default();
+    meta.0.insert(CLASS_META_KEY.to_owned(), Value::String(class.name().to_owned()));
+    tool.meta = Some(meta);
+}
+
 /// Whether a tool can be called with no arguments.
 fn takes_no_argument(tool: &Tool) -> bool {
     tool.input_schema
@@ -196,17 +211,23 @@ impl<S: ServerHandler> ServerHandler for Gated<S> {
             tools.append(&mut listed.tools);
             listed.tools = tools;
         }
+        for tool in &mut listed.tools {
+            if let Some(class) = self.class_of(&tool.name) {
+                stamp(tool, &class);
+            }
+        }
         Ok(listed)
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
-        if !self.allowed(name) {
-            return None;
-        }
-        if diag::TOOLS.contains(&name) {
-            return diag::tools().into_iter().find(|t| t.name == name);
-        }
-        self.inner.get_tool(name)
+        let class = self.class_of(name).filter(|c| self.shared.consent().allows(c))?;
+        let mut tool = if diag::TOOLS.contains(&name) {
+            diag::tools().into_iter().find(|t| t.name == name)?
+        } else {
+            self.inner.get_tool(name)?
+        };
+        stamp(&mut tool, &class);
+        Some(tool)
     }
 
     async fn call_tool(

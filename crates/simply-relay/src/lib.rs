@@ -2,7 +2,8 @@
 //! that connection, behind the member's consent.
 //!
 //! The app opens one WebSocket to Lumina (`wss://…/devices/v1`), proves who it
-//! is in the first frame ([`wire`]), and then serves any rmcp 3.x
+//! is in the first frame, a hello signed with its device key ([`wire`]), and
+//! then serves any rmcp 3.x
 //! [`ServerHandler`] over the socket, one JSON-RPC
 //! message per text frame ([`frames`]), with Lumina as the MCP client.
 //! Nothing on the member's side listens, so NAT and firewalls don't matter.
@@ -13,6 +14,20 @@
 //! ([`calls`]). The standard diagnostics ([`diag`]) are served beside the
 //! app's tools.
 //!
+//! # Linking
+//!
+//! The relay does not link. The app links itself over HTTP with
+//! `simply_hooks::device::link`, keeps the device id and key it gets (in the
+//! keychain: `simply_hooks::keys`), and hands them to the relay through a
+//! callback on every dial ([`Builder::key`]). The code it swaps comes from
+//! Discord: the owner's `/devices add` makes a device whose tools Lumina may
+//! offer, and gives a one-time code; a member's own `/<app> link` gives one
+//! too, for a link Lumina never offers to a model. Either way the app sends
+//! the code to `/devices/v1/link` and the answer is the key's only
+//! appearance. Keys change only when the owner re-keys the device: the next
+//! welcome then carries the new key, and the relay hands it to the app
+//! ([`Builder::on_new_key`]) before it serves anything.
+//!
 //! # Adopting it
 //!
 //! An app compiles the relay in behind its own optional feature, so a build
@@ -22,13 +37,21 @@
 //! [features]
 //! lumina = ["dep:simply-relay"]
 //! [dependencies]
-//! simply-relay = { git = "https://github.com/simply-audio/simply-api", tag = "v0.2.0", optional = true }
+//! simply-relay = { git = "https://github.com/simply-audio/simply-api", tag = "v0.3.0", optional = true }
 //! ```
 //!
 //! ```rust,ignore
 //! #[cfg(feature = "lumina")]
 //! let relay = simply_relay::Relay::builder("tussen", env!("CARGO_PKG_VERSION"), config_dir)
-//!     .read_only(["get_state", "levels", "mesh_peers"])
+//!     .key(move || {
+//!         let device_id = settings.device_id()?;
+//!         let key = keychain.get(&device_id).ok().flatten()?;
+//!         Some(simply_relay::DeviceKey { device_id, key })
+//!     })
+//!     .on_new_key(move |device| keychain.set(&device.device_id, &device.key))
+//!     // read-only tools from the trait's `#[api(read_only)]` marks
+//!     .read_only(TUSSEN_API_META.read_only_tools())
+//!     .action("perform", TUSSEN_API_META.actions_in("perform"))
 //!     .config(move || serde_json::to_value(hub.config()).unwrap_or_default())
 //!     .redactor(|config| { config["studio"]["owner_email"] = "[redacted]".into(); })
 //!     .spawn(move || McpApiServer::new(api.clone(), tussen_api_tool_router::<dyn TussenApi>()))?;
@@ -37,9 +60,10 @@
 //! let subscriber = subscriber.with(simply_relay::log_layer());
 //! ```
 //!
-//! The settings panel then calls [`Relay::pair`] with the code `/support
-//! link` showed, [`Relay::set_read_only`] / [`Relay::set_action`] for the
-//! switches, [`Relay::recent_calls`] for the log and [`Relay::disconnect`].
+//! The settings panel then calls [`Relay::set_read_only`] /
+//! [`Relay::set_action`] for the switches, [`Relay::recent_calls`] for the
+//! log, [`Relay::connect`] once it has linked (or after an unlinked or
+//! stopped status) and [`Relay::disconnect`] to stop dialling.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -62,66 +86,40 @@ pub mod wire;
 pub use calls::{CallRecord, Verdict};
 pub use diag::log_layer;
 pub use gate::Gated;
+pub use simply_hooks::Secret;
 pub use store::{Class, Consent};
+
+/// A linked device's id and key, as the app keeps them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceKey {
+    /// 32 lowercase hex digits.
+    pub device_id: String,
+    /// 64 lowercase hex digits, exactly as the link answer gave it.
+    pub key: Secret,
+}
 
 /// Where the relay is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Status {
-    /// Not linked: waiting for [`Relay::pair`].
-    Unpaired,
+    /// The key callback has no key: link the app, then [`Relay::connect`].
+    NotLinked,
     /// Dialling, or saying hello.
     Connecting,
     /// Serving Lumina.
-    Connected { device_id: String, linked_to: Option<String> },
-    /// The last attempt failed; the next one is after this long.
-    Retrying { after: Duration, error: String },
-    /// Lumina no longer knows this device (unlinked or revoked). The link is
-    /// forgotten; pair again to come back.
+    Connected { device_id: String, member: Option<String> },
+    /// The last attempt failed; the next one is after this long. `reason` is
+    /// set when Lumina refused (`clock`: tell the member to check the
+    /// computer's clock).
+    Retrying { after: Duration, error: String, reason: Option<wire::RefusedReason> },
+    /// Lumina no longer knows this device, or the signature did not check.
+    /// Nothing is dialled until [`Relay::connect`]: offer to link again.
     Unlinked { message: String },
     /// Lumina no longer serves this app's protocol revision. The app needs an
-    /// update; nothing is dialled until then.
+    /// update; nothing is dialled until [`Relay::connect`].
     Stopped { message: String },
+    /// [`Relay::disconnect`]ed: nothing is dialled until [`Relay::connect`].
+    Disconnected,
 }
-
-/// What a successful [`Relay::pair`] linked.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Linked {
-    pub device_id: String,
-    /// Whose account, as Lumina named the member: show "linked to @name".
-    pub member: Option<String>,
-}
-
-/// Why [`Relay::pair`] did not link.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PairError {
-    /// The code is wrong, already used, or expired. Lumina's sentence.
-    Code(String),
-    /// Lumina refused for another reason (devices switched off, too many
-    /// attempts…).
-    Refused(wire::RefusedReason, String),
-    /// Lumina could not be reached, or did not answer in time.
-    Connect(String),
-    /// Linked, but the token could not be written, so the link is dropped.
-    Store(String),
-    /// Another pairing or a shutdown replaced this one.
-    Interrupted,
-}
-
-impl std::fmt::Display for PairError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Code(m) => {
-                write!(f, "{}", if m.is_empty() { "that code did not work" } else { m })
-            }
-            Self::Refused(reason, m) => write!(f, "Lumina refused ({reason:?}): {m}"),
-            Self::Connect(m) => write!(f, "could not reach Lumina: {m}"),
-            Self::Store(m) => write!(f, "could not save the link: {m}"),
-            Self::Interrupted => write!(f, "pairing was interrupted"),
-        }
-    }
-}
-
-impl std::error::Error for PairError {}
 
 /// Reconnect pacing: start at `min`, double on each failure up to `max`,
 /// each wait jittered by ±25 %.
@@ -138,6 +136,8 @@ impl Default for Backoff {
 }
 
 type ConfigSource = Arc<dyn Fn() -> Value + Send + Sync>;
+type KeySource = Arc<dyn Fn() -> Option<DeviceKey> + Send + Sync>;
+type KeySink = Arc<dyn Fn(&DeviceKey) -> Result<(), String> + Send + Sync>;
 
 /// State every connection and the app's handle share.
 pub(crate) struct Shared {
@@ -145,6 +145,8 @@ pub(crate) struct Shared {
     pub version: String,
     pub label: String,
     pub endpoint: String,
+    pub key: KeySource,
+    pub new_key: Option<KeySink>,
     /// The app's declared tools and their classes.
     pub classes: BTreeMap<String, Class>,
     pub action_classes: Vec<String>,
@@ -210,6 +212,8 @@ pub struct Builder {
     dir: PathBuf,
     log_dir: Option<PathBuf>,
     endpoint: String,
+    key: Option<KeySource>,
+    new_key: Option<KeySink>,
     label: Option<String>,
     build: Option<String>,
     classes: BTreeMap<String, Class>,
@@ -222,10 +226,31 @@ pub struct Builder {
 }
 
 impl Builder {
-    /// Dial somewhere other than [`wire::DEFAULT_ENDPOINT`]. A linked device
-    /// keeps dialling the endpoint that issued its token.
+    /// Dial somewhere other than [`wire::DEFAULT_ENDPOINT`].
     pub fn endpoint(mut self, url: impl Into<String>) -> Self {
         self.endpoint = url.into();
+        self
+    }
+
+    /// Where the device id and key come from: called before every dial, off
+    /// the async threads, so it may read the keychain. `None` means not
+    /// linked; the relay waits for [`Relay::connect`]. Without it the relay
+    /// never dials.
+    pub fn key(mut self, source: impl Fn() -> Option<DeviceKey> + Send + Sync + 'static) -> Self {
+        self.key = Some(Arc::new(source));
+        self
+    }
+
+    /// Where a new key goes when the owner re-keyed the device: called with
+    /// it before anything is served, off the async threads. The key callback
+    /// must return it from then on. An error, or no callback, closes that
+    /// connection unserved; the next dial, still signed with the old key,
+    /// is handed the new key again.
+    pub fn on_new_key(
+        mut self,
+        sink: impl Fn(&DeviceKey) -> Result<(), String> + Send + Sync + 'static,
+    ) -> Self {
+        self.new_key = Some(Arc::new(sink));
         self
     }
 
@@ -242,7 +267,7 @@ impl Builder {
         self
     }
 
-    /// Where the call log goes (default: the directory the token file is in).
+    /// Where the call log goes (default: the directory the switches are in).
     pub fn log_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.log_dir = Some(dir.into());
         self
@@ -250,7 +275,10 @@ impl Builder {
 
     /// Declare these of the app's tools read-only: the diagnostics switch
     /// covers them, and `lumina_report` runs the ones that take no argument.
-    /// Written by hand on purpose: nothing is read-only by inference.
+    /// Declared on purpose, never inferred: an app on simply-api passes the
+    /// tools its trait marks `#[api(read_only)]`
+    /// (`ServiceMeta::read_only_tools`); a handler's own `readOnlyHint` is
+    /// not trusted.
     pub fn read_only<I: IntoIterator<Item = T>, T: Into<String>>(mut self, tools: I) -> Self {
         for tool in tools {
             self.classes.insert(tool.into(), Class::ReadOnly);
@@ -328,9 +356,7 @@ impl Builder {
         for class in &self.action_classes {
             stored.consent.actions.entry(class.clone()).or_insert(false);
         }
-        let status =
-            if stored.credentials().is_some() { Status::Connecting } else { Status::Unpaired };
-        let (status, _) = watch::channel(status);
+        let (status, _) = watch::channel(Status::Connecting);
         let label = self.label.unwrap_or_else(|| host_name().unwrap_or_else(|| self.app.clone()));
         let shared = Arc::new(Shared {
             about: diag::AboutSource {
@@ -343,6 +369,8 @@ impl Builder {
             version: self.version,
             label,
             endpoint: self.endpoint,
+            key: self.key.unwrap_or_else(|| Arc::new(|| None)),
+            new_key: self.new_key,
             classes: self.classes,
             action_classes: self.action_classes,
             calls: calls::CallLog::new(self.log_dir.as_deref().unwrap_or(&self.dir)),
@@ -374,8 +402,8 @@ fn host_name() -> Option<String> {
 }
 
 pub(crate) enum Command {
-    Pair(String, oneshot::Sender<Result<Linked, PairError>>),
-    Unlink(oneshot::Sender<()>),
+    Connect,
+    Disconnect(oneshot::Sender<()>),
     Shutdown,
 }
 
@@ -389,8 +417,8 @@ pub struct Relay {
 }
 
 impl Relay {
-    /// Start building a relay for `app` at `version`, keeping its file in
-    /// `dir` (the app's config directory).
+    /// Start building a relay for `app` at `version`, keeping its switches
+    /// in `dir` (the app's config directory).
     pub fn builder(
         app: impl Into<String>,
         version: impl Into<String>,
@@ -402,6 +430,8 @@ impl Relay {
             dir: dir.as_ref().to_owned(),
             log_dir: None,
             endpoint: wire::DEFAULT_ENDPOINT.into(),
+            key: None,
+            new_key: None,
             label: None,
             build: None,
             classes: BTreeMap::new(),
@@ -423,25 +453,20 @@ impl Relay {
         self.shared.status.subscribe()
     }
 
-    /// Link this app with the code `/support link` showed the member. A
-    /// linked app is re-linked (to whoever's code it is). Returns once Lumina
-    /// has answered and the token is stored; the relay then serves on that
-    /// connection.
-    pub async fn pair(&self, code: &str) -> Result<Linked, PairError> {
-        let (tx, rx) = oneshot::channel();
-        let code = code.trim().to_owned();
-        if self.commands.send(Command::Pair(code, tx)).is_err() {
-            return Err(PairError::Interrupted);
-        }
-        rx.await.unwrap_or(Err(PairError::Interrupted))
+    /// Dial now, with whatever key the key callback has: after the app
+    /// linked, after an [`Status::Unlinked`] or [`Status::Stopped`], after
+    /// [`Relay::disconnect`], or to skip a backoff wait. A live connection is
+    /// kept.
+    pub fn connect(&self) {
+        let _ = self.commands.send(Command::Connect);
     }
 
-    /// "Disconnect": tell Lumina to forget this device (best effort, if it
-    /// can be reached) and forget the link here. The switches stay as they
-    /// are.
+    /// Close the connection and stop dialling until [`Relay::connect`]. The
+    /// switches stay as they are. To unlink, the app also calls
+    /// `simply_hooks::device::unlink` and forgets its key.
     pub async fn disconnect(&self) {
         let (tx, rx) = oneshot::channel();
-        if self.commands.send(Command::Unlink(tx)).is_ok() {
+        if self.commands.send(Command::Disconnect(tx)).is_ok() {
             let _ = rx.await;
         }
     }
@@ -492,7 +517,7 @@ impl Relay {
         self.shared.calls.recent(n)
     }
 
-    /// The token file.
+    /// The switches' file.
     pub fn store_path(&self) -> &Path {
         self.shared.store.path()
     }
