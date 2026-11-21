@@ -52,6 +52,9 @@ pub struct ParsedMethod {
     /// advertised in. Optional here; a server that advertises by tier
     /// (`simply_api::mcp::Tiers`) refuses a tool without one.
     pub tier: Option<String>,
+    /// `#[api(read_only)]` — the method only reads: an app that offers its
+    /// tools to Lumina declares these read-only. Unmarked is not read-only.
+    pub read_only: bool,
     /// `#[api(no_tool)]` — dispatchable and callable, but not an MCP tool.
     pub no_tool: bool,
     /// `#[api(no_output_schema)]` — the tool advertises no `outputSchema`;
@@ -122,7 +125,7 @@ fn parse_method(method: &syn::TraitItemFn) -> syn::Result<ParsedMethod> {
         }
     }
 
-    let ApiAttrs { no_tool, media, no_output_schema, tier, name: name_override, opaque } =
+    let ApiAttrs { no_tool, media, no_output_schema, tier, read_only, name: name_override, opaque } =
         parse_api_attrs(&method.attrs)?;
     if opaque {
         return Err(syn::Error::new_spanned(
@@ -155,6 +158,7 @@ fn parse_method(method: &syn::TraitItemFn) -> syn::Result<ParsedMethod> {
         doc,
         help,
         tier,
+        read_only,
         no_tool,
         no_output_schema,
         media,
@@ -175,12 +179,14 @@ struct ApiAttrs {
     media: bool,
     no_output_schema: bool,
     opaque: bool,
+    read_only: bool,
     tier: Option<String>,
     name: Option<String>,
 }
 
 /// `#[api(no_tool)]`, `#[api(media)]`, `#[api(no_output_schema)]`,
-/// `#[api(tier = "...")]`, `#[api(name = "...")]` on a method and
+/// `#[api(read_only)]`, `#[api(tier = "...")]`, `#[api(name = "...")]` on a
+/// method and
 /// `#[api(opaque)]` on a parameter — combinable in one list.
 fn parse_api_attrs(attrs: &[syn::Attribute]) -> syn::Result<ApiAttrs> {
     let mut parsed = ApiAttrs::default();
@@ -200,6 +206,8 @@ fn parse_api_attrs(attrs: &[syn::Attribute]) -> syn::Result<ApiAttrs> {
                 parsed.no_output_schema = true;
             } else if meta.path.is_ident("opaque") {
                 parsed.opaque = true;
+            } else if meta.path.is_ident("read_only") {
+                parsed.read_only = true;
             } else if meta.path.is_ident("tier") {
                 parsed.tier = Some(string(&meta)?);
             } else if meta.path.is_ident("name") {
@@ -207,7 +215,8 @@ fn parse_api_attrs(attrs: &[syn::Attribute]) -> syn::Result<ApiAttrs> {
             } else {
                 return Err(meta.error(
                     "unsupported #[api(...)] key; expected `no_tool`, `media`, \
-                     `no_output_schema`, `opaque`, `tier = \"...\"` or `name = \"...\"`",
+                     `no_output_schema`, `opaque`, `read_only`, `tier = \"...\"` or \
+                     `name = \"...\"`",
                 ));
             }
             Ok(())
@@ -264,6 +273,7 @@ fn parse_params(sig: &syn::Signature) -> syn::Result<Vec<ParsedParam>> {
         if attrs.no_tool
             || attrs.media
             || attrs.no_output_schema
+            || attrs.read_only
             || attrs.tier.is_some()
             || attrs.name.is_some()
         {

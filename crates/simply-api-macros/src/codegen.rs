@@ -335,6 +335,7 @@ fn meta_static(parsed: &ParsedTrait, vis: &syn::Visibility, trait_snake: &str) -
         let help = &m.help;
         let tier = m.tier.clone().unwrap_or_default();
         let has_tool = !m.no_tool;
+        let read_only = m.read_only;
         let returns_media = m.media;
         let inner_ty = &m.inner_ty;
         let output_type = quote!(#inner_ty).to_string().replace(' ', "");
@@ -354,6 +355,7 @@ fn meta_static(parsed: &ParsedTrait, vis: &syn::Visibility, trait_snake: &str) -
                 description: #description,
                 help: #help,
                 tier: #tier,
+                read_only: #read_only,
                 has_tool: #has_tool,
                 params: &[#(#params),*],
                 params_schema: ::simply_api::meta::schema_of::<#p_ident>,

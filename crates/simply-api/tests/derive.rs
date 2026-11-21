@@ -123,6 +123,47 @@ fn meta_records_every_method_and_lints_clean() {
     assert!(INVENTORY_API_META.method("remove").unwrap().returns_text);
 }
 
+/// A tiered service: read-only marks meet tiers.
+#[api_service]
+#[async_trait]
+pub trait MixerApi: Send + Sync {
+    /// Current levels.
+    #[api(read_only, tier = "perform")]
+    async fn levels(&self) -> ApiResult<u32>;
+
+    /// Set the gain.
+    #[api(tier = "perform")]
+    async fn set_gain(
+        &self,
+        /// The gain, dB.
+        db: f32,
+    ) -> ApiResult<()>;
+
+    /// The presets there are.
+    #[api(tier = "edit")]
+    #[api(read_only, name = "list_presets")]
+    async fn presets(&self) -> ApiResult<Vec<String>>;
+
+    /// Reads, but is no tool.
+    #[api(no_tool, read_only)]
+    async fn internal(&self) -> ApiResult<()>;
+}
+
+#[test]
+fn read_only_marks_list_the_read_only_tools() {
+    let read_only: Vec<&str> = MIXER_API_META.read_only_tools().collect();
+    assert_eq!(read_only, ["levels", "list_presets"], "tools only, by wire name");
+    assert!(MIXER_API_META.method("internal").unwrap().read_only);
+    assert!(!MIXER_API_META.method("set_gain").unwrap().read_only, "unmarked: not read-only");
+    assert_eq!(MIXER_API_META.actions_in("perform").collect::<Vec<_>>(), ["set_gain"]);
+    assert_eq!(MIXER_API_META.actions_in("edit").count(), 0);
+    assert_eq!(
+        INVENTORY_API_META.read_only_tools().count(),
+        0,
+        "a trait with no marks has no read-only tools"
+    );
+}
+
 #[test]
 fn lint_catches_missing_descriptions() {
     // A deliberately undocumented sibling trait: the lint must flag it.

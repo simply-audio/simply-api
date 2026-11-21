@@ -35,6 +35,7 @@ pub struct Levels {
 #[async_trait]
 pub trait DemoApi: Send + Sync {
     /// Current levels.
+    #[api(read_only)]
     async fn levels(&self) -> ApiResult<Levels>;
 
     /// Echo some text back.
@@ -144,40 +145,52 @@ async fn an_rmcp_1_3_client_drives_an_rmcp_3_server_over_the_websocket() {
     }
 }
 
-/// The whole relay (handshake, rotated token, gate, diagnostics) against
-/// Lumina's rmcp 1.3 client: what the listener in phase 2 must do, written
-/// out.
+/// What Lumina checks a hello's signature with: the `simply` scheme over
+/// `<timestamp>.hello.<device_id>`, keyed with the device key's ASCII bytes.
+fn lumina_checks(key: &str, hello: &simply_relay::wire::Hello) -> bool {
+    let body = format!("hello.{}", hello.device_id);
+    simply_hooks::sign::verify(key.as_bytes(), hello.timestamp, body.as_bytes(), &hello.signature)
+}
+
+/// The whole relay (signed hello, gate, diagnostics) against Lumina's rmcp
+/// 1.3 client: what the listener must do, written out.
 #[tokio::test]
 async fn the_full_relay_serves_lumina_s_rmcp_1_3_client() {
     use futures::{SinkExt, StreamExt};
-    use simply_relay::wire::{AppFrame, Auth, LuminaFrame, Welcome};
+    use simply_relay::wire::{AppFrame, LuminaFrame, Welcome};
 
+    const DEVICE: &str = "0123456789abcdef0123456789abcdef";
+    const KEY: &str = "3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f";
     let dir = tempfile::tempdir().expect("a scratch dir");
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let url = format!("ws://{}/devices/v1", listener.local_addr().expect("addr"));
     let relay = simply_relay::Relay::builder("demo", "0.1.0", dir.path())
         .endpoint(url)
-        .read_only(["levels"])
+        .key(|| {
+            Some(simply_relay::DeviceKey {
+                device_id: DEVICE.into(),
+                key: simply_relay::Secret::new(KEY),
+            })
+        })
+        .read_only(DEMO_API_META.read_only_tools())
         .spawn(|| McpApiServer::new(Arc::new(Demo), demo_api_tool_router::<Demo>()))
         .expect("the relay starts");
     relay.set_read_only(true).expect("switch on");
-    let pairing = tokio::spawn({
-        let relay = relay.clone();
-        async move { relay.pair("CODE").await }
-    });
 
-    // Lumina: accept, read the hello, answer a welcome, then speak MCP.
+    // Lumina: accept, check the signed hello, answer a welcome, then speak
+    // MCP.
     let (tcp, _) = listener.accept().await.expect("a device connects");
     let ws = tokio_tungstenite::accept_async(tcp).await.expect("upgrade");
     let (mut sink, mut stream) =
         simply_relay::frames::json_frames::<_, LuminaFrame, AppFrame>(ws, None);
     let Some(AppFrame::Hello(hello)) = stream.next().await else { panic!("a hello first") };
-    assert_eq!(hello.auth, Auth::Pair { pair: "CODE".into() });
+    assert_eq!((hello.device_id.as_str(), hello.protocol.as_str()), (DEVICE, "mcp"));
+    assert!(lumina_checks(KEY, &hello), "the hello is signed with the device key");
     assert!(hello.consent.read_only);
     sink.send(LuminaFrame::Welcome(Welcome {
-        device_id: "d-1".into(),
-        token: "t-1".into(),
-        member: None,
+        device_id: DEVICE.into(),
+        member: Some("chris".into()),
+        key: None,
     }))
     .await
     .expect("welcome");
@@ -188,7 +201,6 @@ async fn the_full_relay_serves_lumina_s_rmcp_1_3_client() {
         ))
         .await
         .expect("initialize");
-    pairing.await.expect("join").expect("paired");
 
     let mut names: Vec<String> =
         client.list_all_tools().await.expect("list").into_iter().map(|t| t.name.into()).collect();
@@ -196,7 +208,15 @@ async fn the_full_relay_serves_lumina_s_rmcp_1_3_client() {
     assert_eq!(
         names,
         ["levels", "lumina_about", "lumina_config", "lumina_errors", "lumina_log", "lumina_report"],
-        "echo was not declared, so it is not offered"
+        "echo was not marked read-only, so it is not offered"
+    );
+    let tools = client.list_all_tools().await.expect("list");
+    let levels = tools.iter().find(|t| t.name == "levels").expect("levels");
+    assert_eq!(levels.annotations.as_ref().and_then(|a| a.read_only_hint), Some(true));
+    assert_eq!(
+        levels.meta.as_ref().and_then(|m| m.0.get("lumina/class").cloned()),
+        Some(serde_json::json!("read_only")),
+        "Lumina's rmcp 1.3 reads the class the relay stamped"
     );
     let report = client
         .call_tool(rmcp13::model::CallToolRequestParams::new("lumina_report"))

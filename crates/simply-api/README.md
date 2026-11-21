@@ -4,7 +4,7 @@ One async trait → every surface derived.
 
 `#[api_service]` on an `#[async_trait]` trait derives, with zero marginal work per capability:
 
-* an **MCP tool router** (rmcp 3.x): each method is a tool — name from the method (or `#[api(name = "...")]`), description from its doc comment, input schema from a generated per-method params struct (schemars; parameter doc comments become field descriptions), output schema from the return type; `#[api(no_tool)]` opts a method out;
+* an **MCP tool router** (rmcp 3.x): each method is a tool — name from the method (or `#[api(name = "...")]`), description from its doc comment, input schema from a generated per-method params struct (schemars; parameter doc comments become field descriptions), output schema from the return type; `#[api(no_tool)]` opts a method out; `#[api(read_only)]` marks a method that only reads, and `{TRAIT}_META.read_only_tools()` lists them (an unmarked method is not read-only);
 * a **dispatcher** (`{Trait}Dispatcher`) and a **typed remote client** (`Remote{Trait}` over any [`Caller`]) — the seam a real remote transport plugs into; in-process callers just use `Arc<dyn Trait>` (`Dyn{Trait}`) directly;
 * a **method registry** (`{TRAIT}_META`) for lint tests and doc generation.
 

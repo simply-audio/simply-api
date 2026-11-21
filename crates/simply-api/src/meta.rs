@@ -28,6 +28,9 @@ pub struct MethodMeta {
     /// `#[api(tier = "...")]`: which slice of the tool surface advertises
     /// this method. Empty only for `#[api(no_tool)]` methods.
     pub tier: &'static str,
+    /// `#[api(read_only)]`: the method only reads. Declared, never inferred;
+    /// an unmarked method is not read-only.
+    pub read_only: bool,
     /// False for `#[api(no_tool)]` methods (still dispatchable/callable).
     pub has_tool: bool,
     /// The parameters in declaration order (schema property maps are
@@ -110,6 +113,19 @@ impl ServiceMeta {
     pub fn tier(&self, tier: &str) -> impl Iterator<Item = &MethodMeta> + '_ {
         let tier = tier.to_owned();
         self.tools().filter(move |m| m.tier == tier)
+    }
+
+    /// The names of the tools marked `#[api(read_only)]`, in declaration
+    /// order: what an app passes to `simply_relay::Builder::read_only`.
+    pub fn read_only_tools(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.tools().filter(|m| m.read_only).map(|m| m.name)
+    }
+
+    /// The names of `tier`'s tools that are not marked read-only, in
+    /// declaration order: what an app whose action classes follow its tiers
+    /// passes to `simply_relay::Builder::action`.
+    pub fn actions_in(&self, tier: &str) -> impl Iterator<Item = &'static str> + '_ {
+        self.tier(tier).filter(|m| !m.read_only).map(|m| m.name)
     }
 
     /// The `help` tool's answer: one tool's [`MethodMeta::reference`], or —

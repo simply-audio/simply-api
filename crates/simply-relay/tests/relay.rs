@@ -2,17 +2,12 @@
 
 mod common;
 
-use common::{relay, until, FakeLumina, Studio};
-use serde_json::{json, Value};
-use simply_relay::wire::{AppFrame, Auth, RefusedReason};
-use simply_relay::{PairError, Status, Verdict};
+use std::time::Duration;
 
-fn hello_auth(frame: &AppFrame) -> &Auth {
-    match frame {
-        AppFrame::Hello(hello) => &hello.auth,
-        other => panic!("expected a hello, got {other:?}"),
-    }
-}
+use common::{relay, signed_with, until, FakeLumina, Keychain, Studio, DEVICE, KEY, NEW_KEY};
+use serde_json::{json, Value};
+use simply_relay::wire::RefusedReason;
+use simply_relay::{Status, Verdict};
 
 fn stored(dir: &std::path::Path) -> toml::Table {
     toml::from_str(&std::fs::read_to_string(dir.join("lumina.toml")).unwrap()).unwrap()
@@ -25,162 +20,154 @@ fn mode(dir: &std::path::Path) -> u32 {
 }
 
 #[tokio::test]
-async fn pairing_links_the_device_and_stores_its_token_privately() {
+async fn a_linked_app_says_a_signed_hello_and_serves() {
     let dir = tempfile::tempdir().unwrap();
     let lumina = FakeLumina::start().await;
-    let studio = Studio::default();
-    let app = relay(dir.path(), &lumina).spawn({
-        let studio = studio.clone();
-        move || studio.clone()
-    });
-    let app = app.unwrap();
-    assert_eq!(app.status(), Status::Unpaired);
+    let keychain = Keychain::linked();
+    let app = relay(dir.path(), &lumina, &keychain).spawn(Studio::default).unwrap();
 
-    let pairing = tokio::spawn({
-        let app = app.clone();
-        async move { app.pair(" K7Q4-9X2M-PLRT ").await }
-    });
-    let (first, conn) = lumina.accept().await;
-    let AppFrame::Hello(hello) = &first else { panic!("hello") };
-    assert_eq!(hello.auth, Auth::Pair { pair: "K7Q4-9X2M-PLRT".into() });
+    let (hello, conn) = lumina.accept().await;
     assert_eq!((hello.v, hello.app.as_str(), hello.version.as_str()), (1, "studio", "1.2.3"));
-    assert_eq!(hello.label, "test-mac");
+    assert_eq!((hello.label.as_str(), hello.protocol.as_str()), ("test-mac", "mcp"));
+    assert_eq!(hello.device_id, DEVICE);
+    assert!(signed_with(&hello, KEY), "signed now, with the device key: {hello:?}");
     assert!(!hello.consent.read_only, "everything is off by default");
     assert_eq!(hello.consent.actions.get("session"), Some(&false));
 
-    let mcp = conn.welcome("d-1", "token-1", Some("chris")).await;
-    let linked = pairing.await.unwrap().expect("paired");
-    assert_eq!((linked.device_id.as_str(), linked.member.as_deref()), ("d-1", Some("chris")));
-    until(&app, |s| matches!(s, Status::Connected { .. })).await;
+    let mcp = conn.welcome(Some("chris")).await;
+    let status = until(&app, |s| matches!(s, Status::Connected { .. })).await;
+    assert_eq!(
+        status,
+        Status::Connected { device_id: DEVICE.into(), member: Some("chris".into()) }
+    );
+    // With every switch off, Lumina sees nothing.
+    assert!(mcp.tool_names().await.is_empty());
 
-    let file = stored(dir.path());
-    assert_eq!(file["device_id"].as_str(), Some("d-1"));
-    assert_eq!(file["token"].as_str(), Some("token-1"));
-    assert_eq!(file["linked_to"].as_str(), Some("chris"));
-    assert_eq!(file["endpoint"].as_str(), Some(lumina.url.as_str()));
+    // The relay keeps the switches only; the key stays in the keychain.
+    app.set_read_only(true).unwrap();
+    let file = std::fs::read_to_string(dir.path().join("lumina.toml")).unwrap();
+    assert!(!file.contains(KEY) && !file.contains(DEVICE), "{file}");
     #[cfg(unix)]
     assert_eq!(mode(dir.path()), 0o600);
 
-    // With every switch off, Lumina sees nothing.
-    assert!(mcp.tool_names().await.is_empty());
-    app.shutdown().await;
-}
-
-#[tokio::test]
-async fn an_expired_code_links_nothing() {
-    let dir = tempfile::tempdir().unwrap();
-    let lumina = FakeLumina::start().await;
-    let app = relay(dir.path(), &lumina).spawn(Studio::default).unwrap();
-
-    let pairing = tokio::spawn({
-        let app = app.clone();
-        async move { app.pair("OLD-CODE").await }
-    });
-    let (first, conn) = lumina.accept().await;
-    assert!(matches!(hello_auth(&first), Auth::Pair { .. }));
-    conn.refuse(RefusedReason::Code, "That code has expired.").await;
-
-    assert_eq!(pairing.await.unwrap(), Err(PairError::Code("That code has expired.".into())));
-    until(&app, |s| *s == Status::Unpaired).await;
-    assert!(!dir.path().join("lumina.toml").exists(), "nothing is stored");
-    app.shutdown().await;
-}
-
-#[tokio::test]
-async fn a_silent_lumina_fails_the_pairing_instead_of_hanging() {
-    let dir = tempfile::tempdir().unwrap();
-    let lumina = FakeLumina::start().await;
-    let app = relay(dir.path(), &lumina)
-        .handshake_timeout(std::time::Duration::from_millis(200))
-        .spawn(Studio::default)
-        .unwrap();
-    let pairing = tokio::spawn({
-        let app = app.clone();
-        async move { app.pair("CODE").await }
-    });
-    let (_first, _conn) = lumina.accept().await; // never answers
-    assert!(matches!(pairing.await.unwrap(), Err(PairError::Connect(_))));
-    app.shutdown().await;
-}
-
-#[tokio::test]
-async fn the_token_rotates_on_every_connect_and_the_app_reconnects() {
-    let dir = tempfile::tempdir().unwrap();
-    let lumina = FakeLumina::start().await;
-    let app = relay(dir.path(), &lumina).spawn(Studio::default).unwrap();
-
-    let pairing = tokio::spawn({
-        let app = app.clone();
-        async move { app.pair("CODE").await }
-    });
-    let (_, conn) = lumina.accept().await;
-    let mcp = conn.welcome("d-1", "token-1", Some("chris")).await;
-    pairing.await.unwrap().unwrap();
-
-    // Lumina goes away; the app dials again with the token it was given.
+    // Lumina goes away; the app dials again, freshly signed with the same key.
     mcp.client.cancel().await.unwrap();
-    let (first, conn) = lumina.accept().await;
-    assert_eq!(
-        hello_auth(&first),
-        &Auth::Token { device_id: "d-1".into(), token: "token-1".into() }
-    );
-    let mcp = conn.welcome("d-1", "token-2", None).await;
-    until(&app, |s| matches!(s, Status::Connected { .. })).await;
-    let file = stored(dir.path());
-    assert_eq!(file["token"].as_str(), Some("token-2"), "the new token replaced the old");
-    assert_eq!(file["linked_to"].as_str(), Some("chris"), "a welcome without a name keeps it");
-    #[cfg(unix)]
-    assert_eq!(mode(dir.path()), 0o600, "still private after the rewrite");
-
-    // A connection that fails outright is retried, with the newest token.
-    mcp.client.cancel().await.unwrap();
-    let (_, conn) = lumina.accept().await;
+    let (hello, conn) = lumina.accept().await;
+    assert!(signed_with(&hello, KEY));
+    assert!(hello.consent.read_only, "the hello reports the switches as they are");
     drop(conn);
-    until(&app, |s| matches!(s, Status::Retrying { .. })).await;
-    let (first, conn) = lumina.accept().await;
-    assert_eq!(
-        hello_auth(&first),
-        &Auth::Token { device_id: "d-1".into(), token: "token-2".into() }
-    );
-
-    // Revoked: the app forgets its link and stops dialling.
-    conn.refuse(RefusedReason::Unlinked, "This device was unlinked.").await;
-    until(&app, |s| matches!(s, Status::Unlinked { .. })).await;
-    let file = stored(dir.path());
-    assert!(file.get("token").is_none() && file.get("device_id").is_none(), "{file:?}");
+    until(&app, |s| matches!(s, Status::Retrying { reason: None, .. })).await;
+    let (hello, _conn) = lumina.accept().await;
+    assert!(signed_with(&hello, KEY), "a failed connect is retried");
     app.shutdown().await;
 }
 
 #[tokio::test]
-async fn a_restarted_app_dials_with_its_stored_token_and_disconnect_unlinks() {
+async fn an_unlinked_app_waits_until_told_to_connect() {
     let dir = tempfile::tempdir().unwrap();
     let lumina = FakeLumina::start().await;
-    std::fs::write(
-        dir.path().join("lumina.toml"),
-        format!("endpoint = \"{}\"\ndevice_id = \"d-9\"\ntoken = \"kept\"\n", lumina.url),
-    )
-    .unwrap();
-    let app = relay(dir.path(), &lumina).spawn(Studio::default).unwrap();
-    let (first, conn) = lumina.accept().await;
-    assert_eq!(hello_auth(&first), &Auth::Token { device_id: "d-9".into(), token: "kept".into() });
-    let _mcp = conn.welcome("d-9", "fresh", None).await;
+    let keychain = Keychain::default();
+    let app = relay(dir.path(), &lumina, &keychain).spawn(Studio::default).unwrap();
+    until(&app, |s| *s == Status::NotLinked).await;
+    assert!(lumina.quiet_for(Duration::from_millis(200)).await, "nothing is dialled");
+
+    // The app links over HTTP, keeps the key, and tells the relay.
+    keychain.set(KEY);
+    app.connect();
+    let (hello, conn) = lumina.accept().await;
+    assert!(signed_with(&hello, KEY));
+    let _mcp = conn.welcome(Some("chris")).await;
     until(&app, |s| matches!(s, Status::Connected { .. })).await;
 
-    let disconnect = tokio::spawn({
-        let app = app.clone();
-        async move { app.disconnect().await }
-    });
-    let (first, conn) = lumina.accept().await;
-    let AppFrame::Unlink(unlink) = first else { panic!("an unlink frame") };
-    assert_eq!((unlink.device_id.as_str(), unlink.token.as_str()), ("d-9", "fresh"));
-    conn.refuse(RefusedReason::Unlinked, "Unlinked.").await;
-    disconnect.await.unwrap();
-    assert_eq!(app.status(), Status::Unpaired);
-    assert!(stored(dir.path()).get("token").is_none());
+    // Disconnect: the socket closes and nothing is dialled until connect.
+    app.disconnect().await;
+    assert_eq!(app.status(), Status::Disconnected);
+    assert!(lumina.quiet_for(Duration::from_millis(200)).await, "nothing is dialled");
+    app.connect();
+    let (hello, _conn) = lumina.accept().await;
+    assert!(signed_with(&hello, KEY));
     app.shutdown().await;
 }
 
-/// Pair and return a connected Lumina client.
+#[tokio::test]
+async fn a_re_keyed_device_stores_its_new_key_before_serving() {
+    let dir = tempfile::tempdir().unwrap();
+    let lumina = FakeLumina::start().await;
+    let keychain = Keychain::linked();
+    let app = relay(dir.path(), &lumina, &keychain).spawn(Studio::default).unwrap();
+
+    // The keychain refuses the new key: nothing is served, and the next
+    // hello is still signed with the old key.
+    *keychain.refuse_new.lock().unwrap() = true;
+    let (hello, conn) = lumina.accept().await;
+    assert!(signed_with(&hello, KEY));
+    assert!(conn.welcome_with(Some("chris"), Some(NEW_KEY)).await.is_err(), "not served");
+    let status = until(&app, |s| matches!(s, Status::Retrying { .. })).await;
+    assert!(format!("{status:?}").contains("the keychain is locked"), "{status:?}");
+    assert_eq!(keychain.key().as_deref(), Some(KEY));
+
+    // Stored: by the time MCP answers, the keychain holds the new key, and
+    // the next dial signs with it.
+    *keychain.refuse_new.lock().unwrap() = false;
+    let (hello, conn) = lumina.accept().await;
+    assert!(signed_with(&hello, KEY));
+    let mcp = conn.welcome_with(Some("chris"), Some(NEW_KEY)).await.expect("served");
+    assert_eq!(keychain.key().as_deref(), Some(NEW_KEY));
+    mcp.client.cancel().await.unwrap();
+    let (hello, _conn) = lumina.accept().await;
+    assert!(signed_with(&hello, NEW_KEY), "{hello:?}");
+    assert!(!signed_with(&hello, KEY));
+    app.shutdown().await;
+}
+
+#[tokio::test]
+async fn each_refusal_leads_where_the_wire_says() {
+    use RefusedReason::*;
+    // (reason, slowest pace?) for the reasons that keep dialling. The test
+    // backoff runs 20 ms to 200 ms, jittered ±25 %.
+    for (reason, slowest) in
+        [(Clock, true), (Scope, true), (Disabled, true), (Limit, false), (Other, false)]
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let lumina = FakeLumina::start().await;
+        let app = relay(dir.path(), &lumina, &Keychain::linked()).spawn(Studio::default).unwrap();
+        let (_, conn) = lumina.accept().await;
+        conn.refuse(reason.clone(), "no").await;
+        let status = until(&app, |s| matches!(s, Status::Retrying { .. })).await;
+        let Status::Retrying { after, reason: seen, .. } = status else { unreachable!() };
+        assert_eq!(seen, Some(reason.clone()));
+        if slowest {
+            assert!(after >= Duration::from_millis(150), "{reason:?}: {after:?}");
+        } else {
+            assert!(after <= Duration::from_millis(25), "{reason:?}: {after:?}");
+        }
+        let (hello, _conn) = lumina.accept().await;
+        assert!(signed_with(&hello, KEY), "{reason:?}: the link is kept");
+        app.shutdown().await;
+    }
+
+    // The reasons that stop dialling until the app says connect.
+    for reason in [Unlinked, Version] {
+        let dir = tempfile::tempdir().unwrap();
+        let lumina = FakeLumina::start().await;
+        let app = relay(dir.path(), &lumina, &Keychain::linked()).spawn(Studio::default).unwrap();
+        let (_, conn) = lumina.accept().await;
+        conn.refuse(reason.clone(), "This device is no longer linked.").await;
+        let message = "This device is no longer linked.".to_owned();
+        let expected = match reason {
+            Unlinked => Status::Unlinked { message },
+            _ => Status::Stopped { message },
+        };
+        until(&app, |s| *s == expected).await;
+        assert!(lumina.quiet_for(Duration::from_millis(300)).await, "{reason:?}: no dialling");
+        app.connect();
+        let (hello, _conn) = lumina.accept().await;
+        assert!(signed_with(&hello, KEY), "{reason:?}");
+        app.shutdown().await;
+    }
+}
+
+/// Connect and return a connected Lumina client.
 async fn paired(
     dir: &std::path::Path,
     lumina: &FakeLumina,
@@ -188,14 +175,10 @@ async fn paired(
     studio: &Studio,
 ) -> (simply_relay::Relay, common::Mcp) {
     let studio = studio.clone();
-    let app = builder(relay(dir, lumina)).spawn(move || studio.clone()).unwrap();
-    let pairing = tokio::spawn({
-        let app = app.clone();
-        async move { app.pair("CODE").await }
-    });
+    let app =
+        builder(relay(dir, lumina, &Keychain::linked())).spawn(move || studio.clone()).unwrap();
     let (_, conn) = lumina.accept().await;
-    let mcp = conn.welcome("d-1", "t-1", None).await;
-    pairing.await.unwrap().unwrap();
+    let mcp = conn.welcome(None).await;
     until(&app, |s| matches!(s, Status::Connected { .. })).await;
     (app, mcp)
 }
@@ -220,7 +203,14 @@ async fn a_tool_the_switches_do_not_allow_is_refused_before_the_app_sees_it() {
     // Diagnostics on: Lumina is told to re-list, and read-only tools answer.
     app.set_read_only(true).unwrap();
     tokio::time::timeout(common::WAIT, mcp.list_changed.recv()).await.unwrap().unwrap();
-    let mut names = mcp.tool_names().await;
+    // Every listed tool carries its class, the diagnostics included.
+    let tools = mcp.tools().await;
+    for tool in &tools {
+        let read_only = tool.annotations.as_ref().and_then(|a| a.read_only_hint);
+        let class = tool.meta.as_ref().and_then(|m| m.0.get("lumina/class").cloned());
+        assert_eq!((read_only, class), (Some(true), Some(json!("read_only"))), "{}", tool.name);
+    }
+    let mut names: Vec<String> = tools.iter().map(|t| t.name.to_string()).collect();
     names.sort();
     assert_eq!(
         names,
@@ -246,7 +236,14 @@ async fn a_tool_the_switches_do_not_allow_is_refused_before_the_app_sees_it() {
 
     app.set_action("session", true).unwrap();
     tokio::time::timeout(common::WAIT, mcp.list_changed.recv()).await.unwrap().unwrap();
-    assert!(mcp.tool_names().await.contains(&"open_session".to_owned()));
+    let tools = mcp.tools().await;
+    let open = tools.iter().find(|t| t.name == "open_session").expect("listed");
+    assert_eq!(open.annotations.as_ref().and_then(|a| a.read_only_hint), Some(false));
+    assert_eq!(
+        open.meta.as_ref().and_then(|m| m.0.get("lumina/class").cloned()),
+        Some(json!("session"))
+    );
+    assert!(!tools.iter().any(|t| t.name == "wipe"), "undeclared: never listed");
     mcp.call("open_session", json!({}), "jam #jam-chris").await.unwrap();
     assert!(mcp.call("wipe", json!({}), "?").await.is_err());
     assert_eq!(studio.reached(), ["levels", "open_session"]);

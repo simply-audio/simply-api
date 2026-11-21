@@ -19,6 +19,10 @@ pub trait FluxApi: Send + Sync {
     #[api(no_tool)]
     async fn internal_only(&self) -> ApiResult<()>;
 
+    /// Only reads: `FLUX_API_META.read_only_tools()` lists it.
+    #[api(read_only)]
+    async fn levels(&self) -> ApiResult<Levels>;
+
     #[api(name = "render_wav")]
     async fn render(&self, seconds: f32) -> ApiResult<RenderResult>;
 }

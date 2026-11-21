@@ -14,8 +14,8 @@ use rmcp::service::{NotificationContext, RequestContext, RoleClient, RoleServer,
 use rmcp::{ClientHandler, ErrorData, ServerHandler, ServiceExt};
 use serde_json::{json, Value};
 use simply_relay::frames::{json_frames, FrameSink, FrameStream};
-use simply_relay::wire::{AppFrame, LuminaFrame, Refused, RefusedReason, Welcome};
-use simply_relay::{Backoff, Builder, Relay};
+use simply_relay::wire::{AppFrame, Hello, LuminaFrame, Refused, RefusedReason, Welcome};
+use simply_relay::{Backoff, Builder, DeviceKey, Relay, Secret};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
@@ -87,9 +87,55 @@ impl ServerHandler for Studio {
     }
 }
 
-/// A relay for "studio" in `dir`, dialling `lumina`, with fast pacing.
-pub fn relay(dir: &std::path::Path, lumina: &FakeLumina) -> Builder {
-    Relay::builder("studio", "1.2.3", dir)
+// ── the app's keychain ──────────────────────────────────────────────────
+
+pub const DEVICE: &str = "0123456789abcdef0123456789abcdef";
+pub const KEY: &str = "3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f";
+pub const NEW_KEY: &str = "4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e";
+
+/// Where the test app keeps its device key: what the key callback reads and
+/// the new-key callback writes. `refuse_new` makes the write fail.
+#[derive(Clone, Default)]
+pub struct Keychain {
+    pub key: Arc<Mutex<Option<DeviceKey>>>,
+    pub refuse_new: Arc<Mutex<bool>>,
+}
+
+impl Keychain {
+    pub fn linked() -> Self {
+        let keychain = Self::default();
+        keychain.set(KEY);
+        keychain
+    }
+
+    pub fn set(&self, key: &str) {
+        *self.key.lock().unwrap() =
+            Some(DeviceKey { device_id: DEVICE.into(), key: Secret::new(key) });
+    }
+
+    pub fn key(&self) -> Option<String> {
+        self.key.lock().unwrap().as_ref().map(|d| d.key.expose().to_owned())
+    }
+
+    /// The key and new-key callbacks on `builder`.
+    pub fn on(&self, builder: Builder) -> Builder {
+        let (read, write) = (self.clone(), self.clone());
+        builder.key(move || read.key.lock().unwrap().clone()).on_new_key(move |device| {
+            if *write.refuse_new.lock().unwrap() {
+                return Err("the keychain is locked".into());
+            }
+            *write.key.lock().unwrap() = Some(device.clone());
+            Ok(())
+        })
+    }
+}
+
+/// A relay for "studio" in `dir`, dialling `lumina`, with fast pacing and
+/// its key in `keychain`.
+pub fn relay(dir: &std::path::Path, lumina: &FakeLumina, keychain: &Keychain) -> Builder {
+    let builder = Relay::builder("studio", "1.2.3", dir);
+    keychain
+        .on(builder)
         .endpoint(lumina.url.clone())
         .label("test-mac")
         .read_only(["levels", "echo"])
@@ -118,8 +164,8 @@ impl FakeLumina {
         Self { listener, url }
     }
 
-    /// The next device's first frame.
-    pub async fn accept(&self) -> (AppFrame, Conn) {
+    /// The next device's hello.
+    pub async fn accept(&self) -> (Hello, Conn) {
         let (tcp, _) = tokio::time::timeout(WAIT, self.listener.accept())
             .await
             .expect("a device dials within the wait")
@@ -128,8 +174,22 @@ impl FakeLumina {
         let (sink, mut stream) = json_frames::<_, LuminaFrame, AppFrame>(ws, None);
         let first =
             tokio::time::timeout(WAIT, stream.next()).await.unwrap().expect("a first frame");
-        (first, Conn { sink, stream })
+        let AppFrame::Hello(hello) = first;
+        (hello, Conn { sink, stream })
     }
+
+    /// No device dials within `wait`.
+    pub async fn quiet_for(&self, wait: Duration) -> bool {
+        tokio::time::timeout(wait, self.listener.accept()).await.is_err()
+    }
+}
+
+/// Does `hello` carry a good signature under `key`, signed about now?
+pub fn signed_with(hello: &Hello, key: &str) -> bool {
+    use simply_relay::wire::verify_hello;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    hello.timestamp.abs_diff(now) <= 5
+        && verify_hello(key, hello.timestamp, &hello.device_id, &hello.signature)
 }
 
 /// What a connected MCP client saw.
@@ -153,12 +213,23 @@ impl Conn {
         let _ = self.sink.close().await;
     }
 
-    /// Welcome the device and connect to it as Lumina's MCP client.
-    pub async fn welcome(mut self, device_id: &str, token: &str, member: Option<&str>) -> Mcp {
+    /// Welcome the device as `member` and connect to it as Lumina's MCP
+    /// client.
+    pub async fn welcome(self, member: Option<&str>) -> Mcp {
+        self.welcome_with(member, None).await.expect("the device serves MCP")
+    }
+
+    /// Welcome the device, handing it `key` when given (a re-keyed device),
+    /// and try to connect as Lumina's MCP client.
+    pub async fn welcome_with(
+        mut self,
+        member: Option<&str>,
+        key: Option<&str>,
+    ) -> Result<Mcp, String> {
         let welcome = Welcome {
-            device_id: device_id.into(),
-            token: token.into(),
+            device_id: DEVICE.into(),
             member: member.map(Into::into),
+            key: key.map(Into::into),
         };
         self.sink.send(LuminaFrame::Welcome(welcome)).await.unwrap();
         let (tx, list_changed) = mpsc::unbounded_channel();
@@ -166,20 +237,18 @@ impl Conn {
             self.sink.retype::<rmcp::model::ClientJsonRpcMessage>(),
             self.stream.retype::<rmcp::model::ServerJsonRpcMessage>(),
         );
-        let client = Watcher(tx).serve(transport).await.expect("the device serves MCP");
-        Mcp { client, list_changed }
+        let client = Watcher(tx).serve(transport).await.map_err(|e| e.to_string())?;
+        Ok(Mcp { client, list_changed })
     }
 }
 
 impl Mcp {
+    pub async fn tools(&self) -> Vec<Tool> {
+        self.client.list_all_tools().await.unwrap()
+    }
+
     pub async fn tool_names(&self) -> Vec<String> {
-        self.client
-            .list_all_tools()
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|t| t.name.to_string())
-            .collect()
+        self.tools().await.into_iter().map(|t| t.name.to_string()).collect()
     }
 
     /// Call `tool` with `purpose` in `_meta`.
