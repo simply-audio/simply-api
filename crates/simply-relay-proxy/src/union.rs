@@ -130,8 +130,10 @@ impl Union {
 
 impl ServerHandler for Union {
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().enable_tool_list_changed().build())
-            .with_server_info(Implementation::new(crate::config::APP, env!("CARGO_PKG_VERSION")))
+        ServerConfig::new(
+            ServerCapabilities::builder().enable_tools().enable_tool_list_changed().build(),
+        )
+        .with_server_info(Implementation::new(crate::config::APP, env!("CARGO_PKG_VERSION")))
     }
 
     async fn list_tools(

@@ -282,8 +282,10 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "# my servers\n[servers.tussen]\nurl = \"http://127.0.0.1:1/mcp\"\n")
             .unwrap();
-        let device =
-            DeviceKey { device_id: "0123456789abcdef0123456789abcdef".into(), key: Secret::new("ab") };
+        let device = DeviceKey {
+            device_id: "0123456789abcdef0123456789abcdef".into(),
+            key: Secret::new("ab"),
+        };
         store_device(&path, &device).unwrap();
         store_device(&path, &DeviceKey { key: Secret::new("cd"), ..device }).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();

@@ -47,7 +47,7 @@ simply-relay = { git = "https://github.com/simply-audio/simply-api", tag = "v0.3
 
 ## Consumers
 
-No app depends on it yet; Lumina is the server it dials. Deliberately independent of `simply-api`: it serves any rmcp 3.x `ServerHandler`, so an app can adopt it before it uses simply-api. It depends on `simply-hooks` for the device link and its signing.
+`simply-relay-proxy`, in this repo, serves a machine's local MCP servers through it; its tools are not known when the relay is built, so it classes them with `Builder::classify`. No app depends on it yet; Lumina is the server it dials. Deliberately independent of `simply-api`: it serves any rmcp 3.x `ServerHandler`, so an app can adopt it before it uses simply-api. It depends on `simply-hooks` for the device link and its signing.
 
 ## Licence
 

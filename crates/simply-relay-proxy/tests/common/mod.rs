@@ -147,7 +147,11 @@ pub fn free_port() -> u16 {
 pub fn options() -> Options {
     let backoff = Backoff { min: Duration::from_millis(20), max: Duration::from_millis(200) };
     Options {
-        local: Pacing { backoff, poll: Duration::from_millis(100), timeout: Duration::from_secs(2) },
+        local: Pacing {
+            backoff,
+            poll: Duration::from_millis(100),
+            timeout: Duration::from_secs(2),
+        },
         relay: backoff,
     }
 }

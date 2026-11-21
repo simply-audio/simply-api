@@ -1,7 +1,8 @@
 //! The app-side gate: what Lumina may see and call, whatever it asks.
 //!
 //! [`Gated`] wraps the app's own `ServerHandler`. `tools/list` shows only
-//! tools the app declared whose class is switched on, plus the standard
+//! tools the app declared (or its classifier, [`crate::Builder::classify`],
+//! classes) whose class is switched on, plus the standard
 //! diagnostics while diagnostics are on. `tools/call` refuses everything else
 //! **before** the app's handler sees it, and writes every call, allowed or
 //! refused, to the member's call log. Only tools are exposed: prompts,
