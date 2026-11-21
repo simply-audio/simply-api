@@ -292,6 +292,9 @@ async fn a_classifier_classes_the_tools_nobody_declared() {
         })
     };
     let (app, mut mcp) = paired(dir.path(), &lumina, classify, &studio).await;
+    // Everything is off; the round trip also lets the relay take Lumina's
+    // `initialized` before the switch is flipped.
+    assert!(mcp.tool_names().await.is_empty());
 
     app.set_action("danger", true).unwrap();
     tokio::time::timeout(common::WAIT, mcp.list_changed.recv()).await.unwrap().unwrap();
