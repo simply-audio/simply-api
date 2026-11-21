@@ -20,9 +20,10 @@
 //! `simply_hooks::device::link`, keeps the device id and key it gets (in the
 //! keychain: `simply_hooks::keys`), and hands them to the relay through a
 //! callback on every dial ([`Builder::key`]). The code it swaps comes from
-//! Discord: the owner's `/devices add` makes a device whose tools Lumina may
-//! offer, and gives a one-time code; a member's own `/<app> link` gives one
-//! too, for a link Lumina never offers to a model. Either way the app sends
+//! Discord: the "Add device" button in the owner's `/devices` view makes a
+//! device whose tools Lumina may offer, and gives a one-time code; a
+//! member's own `/<app> link` gives one too, for a link Lumina never offers
+//! to a model. Either way the app sends
 //! the code to `/devices/v1/link` and the answer is the key's only
 //! appearance. Keys change only when the owner re-keys the device: the next
 //! welcome then carries the new key, and the relay hands it to the app

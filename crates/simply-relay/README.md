@@ -8,7 +8,7 @@ Between Lumina and the app's handler sits the [`gate`]: every tool is off until 
 
 ## Linking
 
-The relay does not link. The app links itself over HTTP with `simply_hooks::device::link` and keeps the device id and key in its keychain (`simply_hooks::keys`). The code it swaps comes from Discord: the owner's `/devices add` makes a device whose tools Lumina may offer and gives a one-time code; a member's own `/<app> link` gives one too, for a link Lumina never offers to a model. The app sends the code to `/devices/v1/link`; the answer is the key's only appearance. Unlinking is `simply_hooks::device::unlink`.
+The relay does not link. The app links itself over HTTP with `simply_hooks::device::link` and keeps the device id and key in its keychain (`simply_hooks::keys`). The code it swaps comes from Discord: the "Add device" button in the owner's `/devices` view makes a device whose tools Lumina may offer and gives a one-time code; a member's own `/<app> link` gives one too, for a link Lumina never offers to a model. The app sends the code to `/devices/v1/link`; the answer is the key's only appearance. Unlinking is `simply_hooks::device::unlink`.
 
 The relay asks the app for the key before every dial, and signs the hello with it. Keys change only when the owner re-keys the device: the next welcome carries the new key, and the relay hands it to the app before it serves anything.
 
