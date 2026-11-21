@@ -3,6 +3,43 @@
 What got added, per landing — dated with a clock and the jj change id
 (one entry per landing, newest first).
 
+## 0.3.0 — 2026-11-21
+
+#### `simply-relay` signs its hello with the device key; `#[api(read_only)]` · 2026-11-21 12:04 · vkxsmmsr, mllxrnty
+
+- **Breaking, `simply-relay`.** The relay no longer pairs or keeps tokens.
+  The app links itself with `simply_hooks::device::link` (a one-time code
+  from the "Add device" button in the owner's `/devices` view, or a
+  member's `/<app> link`), keeps the
+  key in its keychain, and gives it to the relay through
+  `Builder::key(|| Some(DeviceKey { device_id, key }))`. Every hello is
+  signed with it: `sha256=` HMAC over `<timestamp>.hello.<device_id>`
+  (`wire::sign_hello`; test vector in the `wire` docs). When the owner has
+  re-keyed the device, the welcome carries the new key and the relay hands
+  it to `Builder::on_new_key` before it serves anything.
+- `Relay::pair`, `PairError`, `Linked`, the `Unlink` frame and the token
+  fields of `lumina.toml` are gone; the file keeps the switches only.
+  `Relay::connect` dials now (after linking, or after an unlinked or
+  stopped status); `Relay::disconnect` stops dialling. `Status` gains
+  `NotLinked` and `Disconnected`, `Connected` names the `member`, and
+  `Retrying` says which refusal it follows.
+- Lumina's refusals: `unlinked` stops dialling; `clock`, `scope` and
+  `disabled` keep the link and retry at the slowest pace; `limit` and any
+  reason not known yet back off; `version` stops until the app is updated.
+- The default endpoint is `wss://lumina.simply.audio/devices/v1`.
+- Every tool the relay lists carries its class: `annotations.readOnlyHint`
+  and `_meta["lumina/class"]` (`read_only` or the action class).
+- **`simply-api`.** `#[api(read_only)]` marks an operation that only reads;
+  `{TRAIT}_META.read_only_tools()` lists them, and
+  `{TRAIT}_META.actions_in(tier)` lists a tier's other tools, so an app
+  passes its read-only and action lists to the relay from the trait.
+  `MethodMeta` gains `read_only`. An unmarked operation is not read-only.
+- The workspace version is 0.3.0.
+- `simply-api` and `simply-relay` need rmcp ≥ 3.4.0 and no longer use
+  rmcp's deprecated `ServerInfo` (now `ServerConfig`), so a consumer on a
+  newer rmcp 3.x builds them with `-D warnings` and gets no warnings
+  (2026-11-21 13:54 · ymwroztt).
+
 ## 0.2.0 — 2026-11-12
 
 #### The repo lives at `simply-audio/simply-api`; each crate has a README · 2026-11-12 21:42 · ppyksuwr, wsnkwunl
