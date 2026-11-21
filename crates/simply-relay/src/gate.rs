@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ListToolsResult,
-    PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo, Tool,
+    PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerConfig, Tool,
 };
 use rmcp::service::{NotificationContext, RequestContext, RoleServer};
 use rmcp::{ErrorData, ServerHandler};
@@ -187,7 +187,7 @@ fn purpose_of(
 }
 
 impl<S: ServerHandler> ServerHandler for Gated<S> {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         let mut info = self.inner.get_info();
         info.capabilities =
             ServerCapabilities::builder().enable_tools().enable_tool_list_changed().build();

@@ -22,7 +22,7 @@ use rmcp::{
     model::{
         CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
         JsonObject, ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities,
-        ServerInfo, Tool,
+        ServerConfig, Tool,
     },
     service::{NotificationContext, Peer, RequestContext, RoleServer},
     ErrorData, ServerHandler,
@@ -187,7 +187,7 @@ impl schemars::JsonSchema for OpaqueArray {
 /// The revisions rmcp knows, kept to the ones it *emits*: everything up to
 /// and including [`ProtocolVersion::LATEST`].
 ///
-/// `KNOWN_VERSIONS` reaches one revision further than `LATEST` — rmcp 3.1.4
+/// `KNOWN_VERSIONS` reaches one revision further than `LATEST` — rmcp 3.4
 /// can parse `2026-07-28` but does not yet produce it, and the default
 /// [`ServerHandler::supported_protocol_versions`] returns the whole list, so
 /// `initialize` echoes back whatever a client asks for. That is how a client
@@ -202,7 +202,7 @@ impl schemars::JsonSchema for OpaqueArray {
 /// `2025-11-25` with a reply it accepted.
 ///
 /// **The cap lifts itself.** It is expressed as `<= LATEST` rather than as a
-/// list, and `LATEST` is what rmcp defaults its own `ServerInfo` to — it
+/// list, and `LATEST` is what rmcp defaults its own `ServerConfig` to — it
 /// moves when the SDK fills the revision's required fields in, not when it
 /// merely learns the version string. Nothing here needs editing then.
 static SUPPORTED_PROTOCOL_VERSIONS: LazyLock<Vec<ProtocolVersion>> = LazyLock::new(|| {
@@ -227,14 +227,14 @@ pub fn supported_protocol_versions() -> &'static [ProtocolVersion] {
 pub struct McpApiServer<A: ?Sized + Send + Sync + 'static> {
     api: Arc<A>,
     tool_router: ToolRouter<Self>,
-    info: ServerInfo,
+    info: ServerConfig,
     /// `None` advertises every tool, alphabetically.
     tiers: Option<Arc<Tiers>>,
 }
 
 impl<A: ?Sized + Send + Sync + 'static> McpApiServer<A> {
     pub fn new(api: Arc<A>, tool_router: ToolRouter<Self>) -> Self {
-        let info = ServerInfo::new(
+        let info = ServerConfig::new(
             ServerCapabilities::builder().enable_tools().enable_tool_list_changed().build(),
         );
         Self { api, tool_router, info, tiers: None }
@@ -282,7 +282,7 @@ impl<A: ?Sized + Send + Sync + 'static> Clone for McpApiServer<A> {
 }
 
 impl<A: ?Sized + Send + Sync + 'static> ServerHandler for McpApiServer<A> {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         self.info.clone()
     }
 

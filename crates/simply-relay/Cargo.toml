@@ -14,7 +14,7 @@ readme = "README.md"
 # reuses; it is no heavier than this crate (ring, rustls, tokio).
 [dependencies]
 futures = "0.3"
-rmcp = { version = "3.1.4", default-features = false, features = ["server"] }
+rmcp = { version = "3.4.0", default-features = false, features = ["server"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 simply-hooks = { workspace = true }
@@ -29,7 +29,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["s
 webpki-roots = "1"
 
 [dev-dependencies]
-rmcp = { version = "3.1.4", default-features = false, features = ["server", "client"] }
+rmcp = { version = "3.4.0", default-features = false, features = ["server", "client"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "registry"] }
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }

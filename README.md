@@ -25,8 +25,8 @@ A consumer depends on `simply-api` alone and gets the other three through it,
 or on `simply-history` + `simply-op-macros` alone for an undo tree with no API.
 
 External dependencies (versions as resolved in flux's `Cargo.lock` at
-`bae34fcf`; this repo's lockfile was seeded from it): `rmcp 3.1.4` (server),
-`schemars 1.2.2`, `serde 1.0.229`, `serde_json 1.0.151`, `async-trait 0.1.92`,
+`bae34fcf`; this repo's lockfile was seeded from it): `rmcp 3.4.0` (server;
+the lowest with `ServerConfig`), `schemars 1.2.2`, `serde 1.0.229`, `serde_json 1.0.151`, `async-trait 0.1.92`,
 `tokio 1.53.1` (`time`), and `syn 2` / `quote 1` / `proc-macro2 1` for the
 two proc-macro crates. Dev only: `futures 0.3`, tokio's runtime features.
 

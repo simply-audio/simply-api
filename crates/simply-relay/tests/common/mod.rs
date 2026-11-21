@@ -8,7 +8,7 @@ use std::time::Duration;
 use futures::{SinkExt, StreamExt};
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ListToolsResult,
-    PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
+    PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
 };
 use rmcp::service::{NotificationContext, RequestContext, RoleClient, RoleServer, RunningService};
 use rmcp::{ClientHandler, ErrorData, ServerHandler, ServiceExt};
@@ -42,8 +42,8 @@ fn schema(v: Value) -> Arc<serde_json::Map<String, Value>> {
 }
 
 impl ServerHandler for Studio {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().enable_prompts().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().enable_prompts().build())
     }
 
     async fn list_tools(
