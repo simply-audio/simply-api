@@ -279,6 +279,37 @@ async fn a_tool_the_switches_do_not_allow_is_refused_before_the_app_sees_it() {
 }
 
 #[tokio::test]
+async fn a_classifier_classes_the_tools_nobody_declared() {
+    let dir = tempfile::tempdir().unwrap();
+    let lumina = FakeLumina::start().await;
+    let studio = Studio::default();
+    let classify = |b: simply_relay::Builder| {
+        b.action("danger", Vec::<String>::new()).classify(|tool| match tool {
+            "wipe" => Some(simply_relay::Class::Action("danger".into())),
+            // Declared as a session action: the declaration wins.
+            "open_session" => Some(simply_relay::Class::ReadOnly),
+            _ => None,
+        })
+    };
+    let (app, mut mcp) = paired(dir.path(), &lumina, classify, &studio).await;
+
+    app.set_action("danger", true).unwrap();
+    tokio::time::timeout(common::WAIT, mcp.list_changed.recv()).await.unwrap().unwrap();
+    let tools = mcp.tools().await;
+    let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+    assert_eq!(names, ["wipe"], "open_session stays under its own switch");
+    assert_eq!(
+        tools[0].meta.as_ref().and_then(|m| m.0.get("lumina/class").cloned()),
+        Some(json!("danger"))
+    );
+    mcp.call("wipe", json!({}), "?").await.unwrap();
+    let session = mcp.call("open_session", json!({}), "?").await.unwrap_err();
+    assert_eq!(session.data, Some(json!({"refused": "switched_off", "class": "session"})));
+    assert_eq!(studio.reached(), ["wipe"]);
+    app.shutdown().await;
+}
+
+#[tokio::test]
 async fn diagnostics_redact_the_config_and_report_everything() {
     use tracing_subscriber::layer::SubscriberExt;
     let subscriber = tracing_subscriber::registry().with(simply_relay::log_layer());

@@ -1,0 +1,54 @@
+[package]
+name = "simply-relay-proxy"
+description = "Serve the MCP servers on your own machine to Lumina over one relay connection: their tools, together, as one device"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "README.md"
+
+[[bin]]
+name = "simply-relay-proxy"
+path = "src/main.rs"
+
+# The relay is `simply-relay`; this crate only adds an MCP client for each
+# local server and the union of their tools. Local servers are reached over
+# plain HTTP (they listen on the machine itself) or stdio, so reqwest is
+# built without TLS.
+[dependencies]
+rmcp = { version = "3.4.0", default-features = false, features = [
+    "server",
+    "client",
+    "transport-child-process",
+    "transport-streamable-http-client-reqwest",
+] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+simply-hooks = { workspace = true }
+simply-relay = { workspace = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "sync", "time", "signal"] }
+toml = "1"
+# Edits the config file in place (the device key) without losing the
+# person's comments and layout.
+toml_edit = "0.23"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "env-filter", "registry", "ansi"] }
+
+[dev-dependencies]
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }
+futures = "0.3"
+rmcp = { version = "3.4.0", default-features = false, features = [
+    "server",
+    "client",
+    "transport-streamable-http-server",
+    "transport-io",
+] }
+tempfile = "3"
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
+
+# Spawns its own binary as a fake stdio MCP server, so it can't run under
+# libtest, which writes to stdout.
+[[test]]
+name = "stdio"
+harness = false

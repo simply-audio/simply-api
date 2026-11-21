@@ -8,6 +8,7 @@ members = [
     "crates/simply-history",
     "crates/simply-op-macros",
     "crates/simply-relay",
+    "crates/simply-relay-proxy",
     "crates/simply-hooks",
     "crates/relay-compat",
 ]

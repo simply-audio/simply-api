@@ -139,6 +139,7 @@ impl Default for Backoff {
 type ConfigSource = Arc<dyn Fn() -> Value + Send + Sync>;
 type KeySource = Arc<dyn Fn() -> Option<DeviceKey> + Send + Sync>;
 type KeySink = Arc<dyn Fn(&DeviceKey) -> Result<(), String> + Send + Sync>;
+type Classifier = Arc<dyn Fn(&str) -> Option<Class> + Send + Sync>;
 
 /// State every connection and the app's handle share.
 pub(crate) struct Shared {
@@ -150,6 +151,8 @@ pub(crate) struct Shared {
     pub new_key: Option<KeySink>,
     /// The app's declared tools and their classes.
     pub classes: BTreeMap<String, Class>,
+    /// Classes for tools not in `classes`, asked on every listing and call.
+    pub classify: Option<Classifier>,
     pub action_classes: Vec<String>,
     pub store: store::Store,
     pub stored: Mutex<store::Stored>,
@@ -168,6 +171,15 @@ pub(crate) struct Shared {
 impl Shared {
     pub fn consent(&self) -> Consent {
         self.lock_stored().consent.clone()
+    }
+
+    /// An app tool's class: declared, else from the classifier. `None`:
+    /// never listed, never called.
+    pub fn class_of(&self, tool: &str) -> Option<Class> {
+        if let Some(class) = self.classes.get(tool) {
+            return Some(class.clone());
+        }
+        self.classify.as_ref().and_then(|classify| classify(tool))
     }
 
     pub fn lock_stored(&self) -> std::sync::MutexGuard<'_, store::Stored> {
@@ -218,6 +230,7 @@ pub struct Builder {
     label: Option<String>,
     build: Option<String>,
     classes: BTreeMap<String, Class>,
+    classify: Option<Classifier>,
     action_classes: Vec<String>,
     config: Option<ConfigSource>,
     redactor: Option<diag::Redactor>,
@@ -308,6 +321,22 @@ impl Builder {
         self
     }
 
+    /// Classify the tools [`Builder::read_only`] and [`Builder::action`] did
+    /// not declare, for a handler whose tools are not known when the relay
+    /// is built (a proxy for other MCP servers). Called with the tool's name
+    /// on every listing and every call, so it must be quick; `None` hides
+    /// the tool and refuses calls to it, as for an undeclared tool. A
+    /// declared tool's class always wins. An action class it returns has
+    /// a switch only if it was also declared with [`Builder::action`]
+    /// (an empty tool list will do); otherwise it stays off.
+    pub fn classify(
+        mut self,
+        classify: impl Fn(&str) -> Option<Class> + Send + Sync + 'static,
+    ) -> Self {
+        self.classify = Some(Arc::new(classify));
+        self
+    }
+
     /// The app's config for `lumina_config`, as JSON (any `Serialize` config
     /// converts with `serde_json::to_value`). Called on each request.
     pub fn config(mut self, source: impl Fn() -> Value + Send + Sync + 'static) -> Self {
@@ -373,6 +402,7 @@ impl Builder {
             key: self.key.unwrap_or_else(|| Arc::new(|| None)),
             new_key: self.new_key,
             classes: self.classes,
+            classify: self.classify,
             action_classes: self.action_classes,
             calls: calls::CallLog::new(self.log_dir.as_deref().unwrap_or(&self.dir)),
             store,
@@ -436,6 +466,7 @@ impl Relay {
             label: None,
             build: None,
             classes: BTreeMap::new(),
+            classify: None,
             action_classes: Vec::new(),
             config: None,
             redactor: None,

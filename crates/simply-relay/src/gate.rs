@@ -54,7 +54,7 @@ impl<S: ServerHandler> Gated<S> {
         if diag::TOOLS.contains(&tool) {
             return Some(Class::ReadOnly);
         }
-        self.shared.classes.get(tool).cloned()
+        self.shared.class_of(tool)
     }
 
     fn allowed(&self, tool: &str) -> bool {
@@ -117,8 +117,7 @@ impl<S: ServerHandler> Gated<S> {
         let mut checks = serde_json::Map::new();
         for tool in listed {
             let name = tool.name.to_string();
-            if self.shared.classes.get(&name) != Some(&Class::ReadOnly) || !takes_no_argument(&tool)
-            {
+            if self.shared.class_of(&name) != Some(Class::ReadOnly) || !takes_no_argument(&tool) {
                 continue;
             }
             self.log(&name, Some(&Class::ReadOnly), Verdict::Allowed, purpose);
