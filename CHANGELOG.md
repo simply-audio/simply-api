@@ -3,6 +3,30 @@
 What got added, per landing — dated with a clock and the jj change id
 (one entry per landing, newest first).
 
+## Unreleased
+
+#### `simply-relay-proxy`: the MCP servers on your machine, served to Lumina as one device · 2026-11-21 15:13 · ytvkuwvx, oynnyyzo
+
+- **New crate and program, `simply-relay-proxy`.** Run it on your own
+  machine: it dials Lumina once with the relay's signed hello and serves
+  the tools of every local MCP server you list in its config
+  (`[servers.<name>]` with a streamable-HTTP `url` or a stdio `command`),
+  named `<server>.<tool>`. Calls go to the server that owns the tool and
+  come back as it answered.
+- Servers come and go: one that starts, stops or changes its tools is
+  announced to Lumina (`tools/list_changed`); a server that is down just
+  has no tools and is retried with backoff (a stdio server is started
+  again). A dropped relay is dialled again with backoff.
+- `simply-relay-proxy pair CODE` swaps the code from `/devices` → Add
+  device for the device key and writes it into the config file (mode
+  0600); a re-keyed device's new key is written back the same way.
+- Switches in `[consent]`, all off by default: `read_only` covers tools
+  the server marks `readOnlyHint` (or its `read_only` list names); each
+  server's other tools are under a switch named after it.
+- **`simply-relay`.** `Builder::classify` classes the tools nobody declared
+  up front, for a handler whose tools change while it runs. Declared tools
+  behave as before.
+
 ## 0.3.0 — 2026-11-21
 
 #### `simply-relay` signs its hello with the device key; `#[api(read_only)]` · 2026-11-21 12:04 · vkxsmmsr, mllxrnty
