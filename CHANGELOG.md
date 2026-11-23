@@ -5,6 +5,24 @@ What got added, per landing — dated with a clock and the jj change id
 
 ## Unreleased
 
+#### rmcp 3.11, and MCP `2026-07-28` served and tested · 2026-11-23 20:29 · llnxnqou, otvlsmyo
+
+- **rmcp 3.11.0** in `simply-api`, `simply-relay` and `simply-relay-proxy`
+  (requirement and lock). A consumer needs rmcp 3.11 or later in its own
+  lock to take this tag.
+- **`McpApiServer` now serves MCP `2026-07-28`**: no `initialize`, the
+  lifecycle in each request's `_meta`, `server/discover`, `resultType` on
+  every result, `ttlMs`/`cacheScope` on `tools/list`. Tests assert each of
+  these on the wire. Clients on older revisions get the same replies as
+  before, `2024-11-05` through `2025-11-25`, Lumina's rmcp 1.3 client included.
+- `simply_api::mcp::MAX_PROTOCOL_VERSION` is the newest revision served. It
+  is pinned, so a later rmcp that learns a newer revision does not start
+  serving it untested.
+- A tier change (`McpApiServer`), a switch flipped in the app (`simply-relay`)
+  and a local server coming or going (`simply-relay-proxy`) now reach a
+  `2026-07-28` client through `subscriptions/listen`. Before, it was told
+  nothing. Older clients are still told on their session.
+
 #### `simply-relay-proxy`: the MCP servers on your machine, served to Lumina as one device · 2026-11-21 15:13 · ytvkuwvx, oynnyyzo
 
 - **New crate and program, `simply-relay-proxy`.** Run it on your own
