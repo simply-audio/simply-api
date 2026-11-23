@@ -3,7 +3,7 @@
 What got added, per landing — dated with a clock and the jj change id
 (one entry per landing, newest first).
 
-## Unreleased
+## 0.4.0 — 2026-11-23
 
 #### `simply-hooks` counts every event it gives up on · 2026-11-23 20:30 · syrzkxkp
 
