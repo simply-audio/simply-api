@@ -23,8 +23,18 @@ What got added, per landing — dated with a clock and the jj change id
 - **`McpApiServer` now serves MCP `2026-07-28`**: no `initialize`, the
   lifecycle in each request's `_meta`, `server/discover`, `resultType` on
   every result, `ttlMs`/`cacheScope` on `tools/list`. Tests assert each of
-  these on the wire. Clients on older revisions get the same replies as
-  before, `2024-11-05` through `2025-11-25`, Lumina's rmcp 1.3 client included.
+  these on the wire. Clients on older revisions, `2024-11-05` through
+  `2025-11-25` (every client that sends `initialize`, Lumina's rmcp 1.3
+  client included), get the replies they got before **except for tool
+  results that are not JSON objects**: those revisions allow only objects,
+  and rmcp 3.11 now holds them to it. A tool returning an array, a
+  string-valued type or a number sends such a client no
+  `structuredContent`; the value is still there as JSON text in the first
+  content block. And `tools/list` sends it no output schema whose
+  top-level `type` is not `"object"`: arrays, strings, and `Option<T>` or
+  enum returns (an `anyOf`/`oneOf` schema). A `2026-07-28` client gets
+  both, as every client did under 0.3.0. Results that are objects are
+  unchanged for everyone.
 - `simply_api::mcp::MAX_PROTOCOL_VERSION` is the newest revision served. It
   is pinned, so a later rmcp that learns a newer revision does not start
   serving it untested.
