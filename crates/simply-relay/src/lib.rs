@@ -71,7 +71,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use rmcp::service::{Peer, RoleServer};
 use rmcp::ServerHandler;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -81,6 +80,7 @@ pub mod diag;
 mod dial;
 pub mod frames;
 pub mod gate;
+pub mod list_changed;
 pub mod store;
 pub mod wire;
 
@@ -163,7 +163,7 @@ pub(crate) struct Shared {
     pub backoff: Backoff,
     pub liveness: Duration,
     pub handshake_timeout: Duration,
-    pub peer: Mutex<Option<Peer<RoleServer>>>,
+    pub list_changed: list_changed::ListChanged,
     pub status: watch::Sender<Status>,
     pub runtime: tokio::runtime::Handle,
 }
@@ -197,20 +197,9 @@ impl Shared {
         config
     }
 
-    pub fn set_peer(&self, peer: Option<Peer<RoleServer>>) {
-        *self.peer.lock().unwrap_or_else(|p| p.into_inner()) = peer;
-    }
-
     /// Tell a connected Lumina to list the tools again.
     fn notify_list_changed(&self) {
-        let peer = self.peer.lock().unwrap_or_else(|p| p.into_inner()).clone();
-        if let Some(peer) = peer {
-            self.runtime.spawn(async move {
-                let _ =
-                    tokio::time::timeout(Duration::from_secs(5), peer.notify_tool_list_changed())
-                        .await;
-            });
-        }
+        self.list_changed.notify(&self.runtime);
     }
 
     pub fn set_status(&self, status: Status) {
@@ -412,7 +401,7 @@ impl Builder {
             backoff: self.backoff,
             liveness: self.liveness,
             handshake_timeout: self.handshake_timeout,
-            peer: Mutex::new(None),
+            list_changed: list_changed::ListChanged::default(),
             status,
             runtime: tokio::runtime::Handle::current(),
         });

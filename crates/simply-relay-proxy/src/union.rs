@@ -4,14 +4,16 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
 
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, Implementation, ListToolsResult,
-    PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
+    PaginatedRequestParams, ServerCapabilities, ServerConfig, SubscriptionFilter, Tool,
 };
-use rmcp::service::{NotificationContext, Peer, RequestContext, RoleClient, RoleServer};
+use rmcp::service::{
+    NotificationContext, Peer, RequestContext, RoleClient, RoleServer, SubscriptionContext,
+};
 use rmcp::{ErrorData, ServerHandler, ServiceError};
+use simply_relay::list_changed::ListChanged;
 use simply_relay::Class;
 
 /// What separates a server's name from its tool's in the names Lumina sees.
@@ -23,14 +25,14 @@ struct Up {
     tools: Vec<Tool>,
 }
 
-/// The local servers that are up, and the Lumina connection to tell when
+/// The local servers that are up, and who on Lumina's side to tell when
 /// that changes.
 #[derive(Default)]
 pub struct Catalog {
     up: Mutex<BTreeMap<String, Up>>,
     /// Per server, the tools the config says are read-only.
     read_only: BTreeMap<String, BTreeSet<String>>,
-    lumina: Mutex<Option<Peer<RoleServer>>>,
+    lumina: ListChanged,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -95,17 +97,9 @@ impl Catalog {
         Some(if listed || hinted { Class::ReadOnly } else { Class::Action(server) })
     }
 
-    fn set_lumina(&self, peer: Peer<RoleServer>) {
-        *lock(&self.lumina) = Some(peer);
-    }
-
     /// Tell a connected Lumina to list the tools again.
     fn notify(&self) {
-        let Some(peer) = lock(&self.lumina).clone() else { return };
-        tokio::spawn(async move {
-            let _ =
-                tokio::time::timeout(Duration::from_secs(5), peer.notify_tool_list_changed()).await;
-        });
+        self.lumina.notify(&tokio::runtime::Handle::current());
     }
 }
 
@@ -171,6 +165,21 @@ impl ServerHandler for Union {
     }
 
     async fn on_initialized(&self, context: NotificationContext<RoleServer>) {
-        self.catalog.set_lumina(context.peer);
+        self.catalog.lumina.set_session(Some(context.peer));
+    }
+
+    /// A `2026-07-28` Lumina has no session to be told on: it listens here.
+    fn accepted_subscription_filter(
+        &self,
+        _requested: &SubscriptionFilter,
+    ) -> Option<SubscriptionFilter> {
+        Some(ListChanged::filter())
+    }
+
+    async fn listen(&self, subscription: SubscriptionContext) -> Result<(), ErrorData> {
+        let key = self.catalog.lumina.subscribe(subscription.sink().clone());
+        subscription.cancelled().await;
+        self.catalog.lumina.unsubscribe(key);
+        Ok(())
     }
 }

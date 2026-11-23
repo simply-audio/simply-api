@@ -197,3 +197,80 @@ async fn a_new_key_from_lumina_is_written_into_the_config() {
     assert!(lumina.quiet_for(std::time::Duration::from_millis(200)).await);
     proxy.shutdown().await;
 }
+
+/// A `2026-07-28` Lumina has no session to be told on: it listens with
+/// `subscriptions/listen`, and a local server coming up reaches it there.
+#[tokio::test]
+async fn a_2026_07_28_lumina_hears_a_server_come_up_through_subscriptions_listen() {
+    use common::relay::{inline, result, RawMcp};
+    use serde_json::Value;
+
+    /// The reply to `id`, past any notification sent before it.
+    async fn reply(mcp: &mut RawMcp, frame: Value) -> Value {
+        let id = frame["id"].clone();
+        mcp.send(frame).await;
+        loop {
+            let next = mcp.next().await;
+            if next["id"] == id {
+                return next;
+            }
+        }
+    }
+    async fn listed(mcp: &mut RawMcp, id: u32) -> Vec<String> {
+        let frame = json!({"jsonrpc": "2.0", "id": id, "method": "tools/list", "params": {}});
+        let listed = reply(mcp, inline(frame)).await;
+        assert_eq!(result(&listed)["resultType"], "complete", "{listed}");
+        let tools = result(&listed)["tools"].as_array().unwrap().iter();
+        let mut names: Vec<String> = tools
+            .map(|t| t["name"].as_str().unwrap().to_owned())
+            .filter(|n| !n.starts_with("lumina_"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let lumina = FakeLumina::start().await;
+    let alpha = Local::new("alpha", vec![tool("read", true)]);
+    let beta = Local::new("beta", vec![tool("status", true)]);
+    let (alpha_port, beta_port) = (free_port(), free_port());
+    let _alpha_server = HttpServer::start(&alpha, alpha_port);
+    let path = config(
+        dir.path(),
+        &lumina,
+        &format!(
+            "[consent]\nread_only = true\n\n\
+             [servers.alpha]\nurl = \"http://127.0.0.1:{alpha_port}/mcp\"\n\n\
+             [servers.beta]\nurl = \"http://127.0.0.1:{beta_port}/mcp\"\n"
+        ),
+    );
+    let proxy = simply_relay_proxy::Proxy::start(&path, common::options()).unwrap();
+    let (_, conn) = lumina.accept().await;
+    let mut mcp = conn.welcome_raw(Some("chris")).await;
+
+    let deadline = tokio::time::Instant::now() + WAIT;
+    let mut id = 1;
+    while listed(&mut mcp, id).await != ["alpha.read"] {
+        assert!(tokio::time::Instant::now() < deadline, "alpha never came up");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        id += 1;
+    }
+
+    let frame = json!({
+        "jsonrpc": "2.0", "id": "watch", "method": "subscriptions/listen",
+        "params": {"notifications": {"toolsListChanged": true}},
+    });
+    mcp.send(inline(frame)).await;
+    let acknowledged = mcp.next().await;
+    assert_eq!(
+        acknowledged["method"], "notifications/subscriptions/acknowledged",
+        "{acknowledged}"
+    );
+
+    let _beta_server = HttpServer::start(&beta, beta_port);
+    let changed = mcp.next().await;
+    assert_eq!(changed["method"], "notifications/tools/list_changed", "{changed}");
+    assert_eq!(changed["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"], "watch");
+    assert_eq!(listed(&mut mcp, 1000).await, ["alpha.read", "beta.status"]);
+    proxy.shutdown().await;
+}

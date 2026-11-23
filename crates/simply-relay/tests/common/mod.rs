@@ -219,6 +219,15 @@ impl Conn {
         self.welcome_with(member, None).await.expect("the device serves MCP")
     }
 
+    /// Welcome the device as `member` and speak MCP to it frame by frame,
+    /// as JSON: for a client on a revision rmcp's own client does not speak.
+    pub async fn welcome_raw(mut self, member: Option<&str>) -> RawMcp {
+        let welcome =
+            Welcome { device_id: DEVICE.into(), member: member.map(Into::into), key: None };
+        self.sink.send(LuminaFrame::Welcome(welcome)).await.unwrap();
+        RawMcp { sink: self.sink.retype(), stream: self.stream.retype() }
+    }
+
     /// Welcome the device, handing it `key` when given (a re-keyed device),
     /// and try to connect as Lumina's MCP client.
     pub async fn welcome_with(
@@ -271,6 +280,71 @@ impl Mcp {
             Err(e) => panic!("transport error: {e}"),
         }
     }
+}
+
+/// Lumina's MCP client written out by hand: JSON-RPC frames as JSON.
+pub struct RawMcp {
+    sink: FrameSink<TcpStream, Value>,
+    stream: FrameStream<TcpStream, Value>,
+}
+
+impl RawMcp {
+    pub async fn send(&mut self, frame: Value) {
+        self.sink.send(frame).await.unwrap();
+    }
+
+    pub async fn next(&mut self) -> Value {
+        tokio::time::timeout(WAIT, self.stream.next())
+            .await
+            .expect("the app answers within the wait")
+            .expect("the socket is still open")
+    }
+
+    pub async fn request(&mut self, frame: Value) -> Value {
+        self.send(frame).await;
+        self.next().await
+    }
+
+    /// `initialize` at `asked`, then `notifications/initialized`: the reply.
+    pub async fn initialize(&mut self, asked: &str) -> Value {
+        let reply = self
+            .request(json!({
+                "jsonrpc": "2.0", "id": 0, "method": "initialize",
+                "params": {
+                    "protocolVersion": asked,
+                    "capabilities": {},
+                    "clientInfo": {"name": "lumina", "version": "0"},
+                },
+            }))
+            .await;
+        self.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"})).await;
+        reply
+    }
+}
+
+/// `frame` carrying the `2026-07-28` lifecycle in its `params._meta`, which
+/// that revision has in place of `initialize`.
+pub fn inline(mut frame: Value) -> Value {
+    frame["params"]["_meta"] = json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientInfo": {"name": "lumina", "version": "0"},
+        "io.modelcontextprotocol/clientCapabilities": {},
+    });
+    frame
+}
+
+/// A reply's `result`, after checking it is not an error.
+pub fn result(reply: &Value) -> &Value {
+    assert!(reply.get("error").is_none(), "the reply is an error: {reply}");
+    &reply["result"]
+}
+
+/// An object's keys, sorted.
+pub fn keys(value: &Value) -> Vec<&str> {
+    let mut keys: Vec<&str> =
+        value.as_object().expect("an object").keys().map(String::as_str).collect();
+    keys.sort();
+    keys
 }
 
 /// Wait until the relay's status matches.

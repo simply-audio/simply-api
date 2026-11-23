@@ -407,3 +407,105 @@ async fn diagnostics_redact_the_config_and_report_everything() {
     );
     app.shutdown().await;
 }
+
+/// A relay for "studio" with diagnostics on, and Lumina's end of it, raw.
+async fn raw(dir: &std::path::Path, lumina: &FakeLumina) -> (simply_relay::Relay, common::RawMcp) {
+    let studio = Studio::default();
+    let app = relay(dir, lumina, &Keychain::linked())
+        .spawn(move || studio.clone())
+        .expect("the relay starts");
+    app.set_read_only(true).unwrap();
+    let (_, conn) = lumina.accept().await;
+    (app, conn.welcome_raw(None).await)
+}
+
+/// Lumina's client is older than the app's rmcp: whatever revision with an
+/// `initialize` handshake it asks for, it is answered its own, in that
+/// revision's shape, and its calls come through.
+#[tokio::test]
+async fn a_client_on_an_older_revision_initializes_and_calls_tools() {
+    use common::{keys, result};
+    for asked in ["2024-11-05", "2025-03-26", "2025-06-18"] {
+        let dir = tempfile::tempdir().unwrap();
+        let lumina = FakeLumina::start().await;
+        let (app, mut mcp) = raw(dir.path(), &lumina).await;
+
+        let initialized = mcp.initialize(asked).await;
+        assert_eq!(result(&initialized)["protocolVersion"], asked, "{initialized}");
+        assert_eq!(result(&initialized)["capabilities"]["tools"]["listChanged"], true);
+
+        let listed = mcp
+            .request(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}))
+            .await;
+        assert_eq!(keys(result(&listed)), ["tools"], "the legacy envelope at {asked}: {listed}");
+        let names: Vec<&str> = result(&listed)["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"levels"), "{names:?}");
+
+        let called = mcp
+            .request(json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": "levels", "arguments": {}},
+            }))
+            .await;
+        assert!(result(&called).get("resultType").is_none(), "no resultType at {asked}: {called}");
+        assert_eq!(result(&called)["structuredContent"], json!({"rate": 48000, "peaks": [-6.0]}));
+        app.shutdown().await;
+    }
+}
+
+/// A `2026-07-28` Lumina has no `initialize`: each request carries its own
+/// lifecycle, results carry that revision's fields, and a switch flipped in
+/// the app reaches it over `subscriptions/listen`.
+#[tokio::test]
+async fn a_2026_07_28_client_lists_calls_and_hears_the_switches() {
+    use common::{inline, keys, result};
+    let dir = tempfile::tempdir().unwrap();
+    let lumina = FakeLumina::start().await;
+    let (app, mut mcp) = raw(dir.path(), &lumina).await;
+
+    let listed = mcp
+        .request(inline(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})))
+        .await;
+    assert_eq!(keys(result(&listed)), ["cacheScope", "resultType", "tools", "ttlMs"], "{listed}");
+    assert_eq!(result(&listed)["resultType"], "complete");
+    let tools = result(&listed)["tools"].as_array().unwrap();
+    assert!(!tools.iter().any(|t| t["name"] == "open_session"), "the action is off");
+
+    let called = mcp
+        .request(inline(json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "levels", "arguments": {}},
+        })))
+        .await;
+    assert_eq!(result(&called)["resultType"], "complete", "{called}");
+    assert_eq!(result(&called)["structuredContent"], json!({"rate": 48000, "peaks": [-6.0]}));
+
+    let acknowledged = mcp
+        .request(inline(json!({
+            "jsonrpc": "2.0", "id": "watch", "method": "subscriptions/listen",
+            "params": {"notifications": {"toolsListChanged": true}},
+        })))
+        .await;
+    assert_eq!(
+        acknowledged["method"], "notifications/subscriptions/acknowledged",
+        "{acknowledged}"
+    );
+    assert_eq!(acknowledged["params"]["notifications"], json!({"toolsListChanged": true}));
+
+    app.set_action("session", true).unwrap();
+    let changed = mcp.next().await;
+    assert_eq!(changed["method"], "notifications/tools/list_changed", "{changed}");
+    assert_eq!(changed["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"], "watch");
+
+    let listed = mcp
+        .request(inline(json!({"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}})))
+        .await;
+    let tools = result(&listed)["tools"].as_array().unwrap();
+    assert!(tools.iter().any(|t| t["name"] == "open_session"), "{listed}");
+    app.shutdown().await;
+}

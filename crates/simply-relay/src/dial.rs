@@ -288,6 +288,6 @@ where
             },
         }
     };
-    shared.set_peer(None);
+    shared.list_changed.set_session(None);
     result
 }

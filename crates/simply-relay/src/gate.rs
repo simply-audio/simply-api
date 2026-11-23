@@ -24,9 +24,10 @@ use std::time::Duration;
 
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ListToolsResult,
-    PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerConfig, Tool,
+    PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerConfig, SubscriptionFilter,
+    Tool,
 };
-use rmcp::service::{NotificationContext, RequestContext, RoleServer};
+use rmcp::service::{NotificationContext, RequestContext, RoleServer, SubscriptionContext};
 use rmcp::{ErrorData, ServerHandler};
 use serde_json::{json, Value};
 
@@ -265,8 +266,26 @@ impl<S: ServerHandler> ServerHandler for Gated<S> {
     }
 
     async fn on_initialized(&self, context: NotificationContext<RoleServer>) {
-        self.shared.set_peer(Some(context.peer.clone()));
+        self.shared.list_changed.set_session(Some(context.peer.clone()));
         self.inner.on_initialized(context).await;
+    }
+
+    /// A `2026-07-28` Lumina asks here for the `tools/list_changed` it has
+    /// no session to receive on. The app's handler holds the stream (and may
+    /// announce its own changes on it); the gate's switches are announced
+    /// beside it.
+    fn accepted_subscription_filter(
+        &self,
+        _requested: &SubscriptionFilter,
+    ) -> Option<SubscriptionFilter> {
+        Some(crate::list_changed::ListChanged::filter())
+    }
+
+    async fn listen(&self, subscription: SubscriptionContext) -> Result<(), ErrorData> {
+        let key = self.shared.list_changed.subscribe(subscription.sink().clone());
+        let ended = self.inner.listen(subscription).await;
+        self.shared.list_changed.unsubscribe(key);
+        ended
     }
 
     async fn on_cancelled(
