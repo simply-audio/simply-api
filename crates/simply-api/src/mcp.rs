@@ -11,8 +11,8 @@
 //! ```
 
 use std::borrow::Cow;
-use std::collections::BTreeSet;
-use std::sync::{Arc, LazyLock, Mutex, RwLock};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex, RwLock};
 
 use rmcp::{
     handler::server::{
@@ -22,9 +22,12 @@ use rmcp::{
     model::{
         CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
         JsonObject, ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities,
-        ServerConfig, Tool,
+        ServerConfig, SubscriptionFilter, Tool,
     },
-    service::{NotificationContext, Peer, RequestContext, RoleServer},
+    service::{
+        NotificationContext, Peer, RequestContext, RoleServer, SubscriptionContext,
+        SubscriptionSink,
+    },
     ErrorData, ServerHandler,
 };
 
@@ -46,10 +49,24 @@ pub struct Tiers {
     /// Every tier there is, in the order `tools/list` groups them.
     order: &'static [&'static str],
     enabled: RwLock<BTreeSet<&'static str>>,
-    /// Every session that has completed `initialize` — notified when the
-    /// setting changes so a connected client re-lists. Dead peers are
-    /// dropped when their notification fails.
-    peers: Mutex<Vec<Peer<RoleServer>>>,
+    /// Who is told when the setting changes, so a connected client re-lists.
+    listeners: Mutex<Listeners>,
+}
+
+/// Where `notifications/tools/list_changed` goes. A client on a revision
+/// with an `initialize` handshake is told on its session once it has sent
+/// `initialized`; a `2026-07-28` client has no handshake and asks for the
+/// notification with `subscriptions/listen`, which holds a stream open
+/// until the client cancels it.
+#[derive(Default)]
+struct Listeners {
+    /// Sessions that completed `initialize`; dropped once their transport
+    /// has closed.
+    sessions: Vec<Peer<RoleServer>>,
+    /// Open `subscriptions/listen` streams, by a key of our own (request
+    /// ids repeat across sessions); each removes itself when it ends.
+    subscriptions: BTreeMap<u64, SubscriptionSink>,
+    next: u64,
 }
 
 impl Tiers {
@@ -75,7 +92,7 @@ impl Tiers {
             meta,
             order,
             enabled: RwLock::new(BTreeSet::new()),
-            peers: Mutex::new(Vec::new()),
+            listeners: Mutex::new(Listeners::default()),
         };
         tiers.set(enabled);
         Arc::new(tiers)
@@ -123,27 +140,56 @@ impl Tiers {
             .collect()
     }
 
-    /// Send `notifications/tools/list_changed` to every connected session,
-    /// each given [`NOTIFY_TIMEOUT`] — a client that opened no event stream
-    /// has nowhere to receive it, and must not hold the setting up. Sessions
-    /// whose transport has closed are forgotten.
+    /// Send `notifications/tools/list_changed` to every connected session
+    /// and every open `subscriptions/listen` stream, each given
+    /// [`NOTIFY_TIMEOUT`] — a client that opened no event stream has nowhere
+    /// to receive it, and must not hold the setting up. Sessions whose
+    /// transport has closed are forgotten.
     pub async fn notify(&self) {
-        let peers: Vec<Peer<RoleServer>> = self.peers.lock().expect("peers lock").clone();
-        for peer in peers {
+        let (sessions, subscriptions) = {
+            let listeners = self.lock_listeners();
+            (
+                listeners.sessions.clone(),
+                listeners.subscriptions.values().cloned().collect::<Vec<_>>(),
+            )
+        };
+        for peer in sessions {
             let _ = tokio::time::timeout(NOTIFY_TIMEOUT, peer.notify_tool_list_changed()).await;
         }
-        self.peers.lock().expect("peers lock").retain(|p| !p.is_transport_closed());
+        for sink in subscriptions {
+            let _ = tokio::time::timeout(NOTIFY_TIMEOUT, sink.notify_tool_list_changed()).await;
+        }
+        self.lock_listeners().sessions.retain(|p| !p.is_transport_closed());
     }
 
-    /// How many sessions would be told of a change.
+    /// How many sessions and subscriptions would be told of a change.
     pub fn connected(&self) -> usize {
-        self.peers.lock().expect("peers lock").len()
+        let listeners = self.lock_listeners();
+        listeners.sessions.len() + listeners.subscriptions.len()
+    }
+
+    fn lock_listeners(&self) -> std::sync::MutexGuard<'_, Listeners> {
+        self.listeners.lock().expect("listeners lock")
     }
 
     fn register(&self, peer: Peer<RoleServer>) {
-        let mut peers = self.peers.lock().expect("peers lock");
-        peers.retain(|p| !p.is_transport_closed());
-        peers.push(peer);
+        let mut listeners = self.lock_listeners();
+        listeners.sessions.retain(|p| !p.is_transport_closed());
+        listeners.sessions.push(peer);
+    }
+
+    /// Hold `subscription` open, told of every change, until the client
+    /// cancels it or its transport closes.
+    async fn listen(&self, subscription: SubscriptionContext) {
+        let key = {
+            let mut listeners = self.lock_listeners();
+            let key = listeners.next;
+            listeners.next += 1;
+            listeners.subscriptions.insert(key, subscription.sink().clone());
+            key
+        };
+        subscription.cancelled().await;
+        self.lock_listeners().subscriptions.remove(&key);
     }
 }
 
@@ -184,40 +230,32 @@ impl schemars::JsonSchema for OpaqueArray {
 
 // ── the protocol revisions the replies actually satisfy ─────────────────
 
-/// The revisions rmcp knows, kept to the ones it *emits*: everything up to
-/// and including [`ProtocolVersion::LATEST`].
+/// The newest protocol revision an [`McpApiServer`] agrees to: the newest
+/// one whose wire shape this crate's tests check (`tests/protocol.rs`).
 ///
-/// `KNOWN_VERSIONS` reaches one revision further than `LATEST` — rmcp 3.4
-/// can parse `2026-07-28` but does not yet produce it, and the default
-/// [`ServerHandler::supported_protocol_versions`] returns the whole list, so
-/// `initialize` echoes back whatever a client asks for. That is how a client
-/// talks the server into a wire shape it does not write: `2026-07-28` makes
-/// `ttlMs` and `cacheScope` **required** on every paginated result, and
-/// rmcp's list constructors leave both `None` (so serde skips them) while
-/// still emitting `resultType: "complete"`. A `tools/list` answered under
-/// that revision is therefore two required fields short, and a client that
-/// validates the reply against the revision's schema rejects the whole tool
-/// list — measured 2026-09-26, where an agent client could not load any tool
-/// from the in-app server, while the same server answered `2025-06-18` and
-/// `2025-11-25` with a reply it accepted.
+/// The ceiling is pinned rather than following rmcp's `KNOWN_VERSIONS`,
+/// because rmcp can learn a revision's name before it writes that revision's
+/// required fields, and the default
+/// [`ServerHandler::supported_protocol_versions`] agrees to every name it
+/// knows. A client asking for such a revision is then answered in a shape it
+/// rejects: a `tools/list` short of required fields fails the client's
+/// schema check and it loads no tool at all.
 ///
-/// **The cap lifts itself.** It is expressed as `<= LATEST` rather than as a
-/// list, and `LATEST` is what rmcp defaults its own `ServerConfig` to — it
-/// moves when the SDK fills the revision's required fields in, not when it
-/// merely learns the version string. Nothing here needs editing then.
-static SUPPORTED_PROTOCOL_VERSIONS: LazyLock<Vec<ProtocolVersion>> = LazyLock::new(|| {
-    ProtocolVersion::KNOWN_VERSIONS
-        .iter()
-        .filter(|version| **version <= ProtocolVersion::LATEST)
-        .cloned()
-        .collect()
-});
+/// `2026-07-28` is served because rmcp now writes what it requires — no
+/// `initialize` (the lifecycle rides in each request's `_meta`),
+/// `resultType` on every result, `ttlMs` and `cacheScope` on `tools/list`
+/// and `server/discover`, notifications only over `subscriptions/listen` —
+/// and the tests assert each of those on the wire. When rmcp learns a newer
+/// revision, `the_ceiling_is_rmcp_s_newest_revision` fails: check what that
+/// revision requires, test it, then raise this.
+pub const MAX_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V_2026_07_28;
 
-/// Every protocol revision an [`McpApiServer`] will negotiate, oldest first
-/// — see `SUPPORTED_PROTOCOL_VERSIONS`. A client asking for anything
-/// outside this set is answered the newest one in it, never its own.
+/// Every protocol revision an [`McpApiServer`] will negotiate, oldest first:
+/// rmcp's known revisions up to [`MAX_PROTOCOL_VERSION`]. A client asking
+/// for anything outside this set is answered the newest one in it that has
+/// an `initialize` handshake, never its own.
 pub fn supported_protocol_versions() -> &'static [ProtocolVersion] {
-    &SUPPORTED_PROTOCOL_VERSIONS
+    ProtocolVersion::known_up_to(&MAX_PROTOCOL_VERSION)
 }
 
 // ── the server ──────────────────────────────────────────────────────────
@@ -287,9 +325,11 @@ impl<A: ?Sized + Send + Sync + 'static> ServerHandler for McpApiServer<A> {
     }
 
     /// Narrow rmcp's default (every version it can name) to the ones whose
-    /// replies we actually write — see `SUPPORTED_PROTOCOL_VERSIONS`. This
-    /// is what bounds `initialize` negotiation, on every transport: the
-    /// streamable-HTTP tower negotiates through this list too.
+    /// replies are tested — see [`MAX_PROTOCOL_VERSION`]. This bounds
+    /// `initialize` negotiation and the per-request versions of
+    /// `2026-07-28`, on every transport: the streamable-HTTP tower
+    /// negotiates through this list too, and `server/discover` advertises
+    /// it.
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
         Cow::Borrowed(supported_protocol_versions())
     }
@@ -322,6 +362,26 @@ impl<A: ?Sized + Send + Sync + 'static> ServerHandler for McpApiServer<A> {
         if let Some(tiers) = &self.tiers {
             tiers.register(context.peer);
         }
+    }
+
+    /// `2026-07-28` clients ask for `tools/list_changed` here, having no
+    /// session to receive it on. Only that notification is offered: it is
+    /// the only capability the server advertises.
+    fn accepted_subscription_filter(
+        &self,
+        _requested: &SubscriptionFilter,
+    ) -> Option<SubscriptionFilter> {
+        Some(SubscriptionFilter::builder().tools_list_changed().build())
+    }
+
+    async fn listen(&self, subscription: SubscriptionContext) -> Result<(), ErrorData> {
+        match &self.tiers {
+            Some(tiers) => tiers.listen(subscription).await,
+            // Without tiers the list never changes: hold the stream until
+            // the client lets go.
+            None => subscription.cancelled().await,
+        }
+        Ok(())
     }
 }
 

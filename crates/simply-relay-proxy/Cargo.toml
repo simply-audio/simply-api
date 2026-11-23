@@ -17,7 +17,7 @@ path = "src/main.rs"
 # plain HTTP (they listen on the machine itself) or stdio, so reqwest is
 # built without TLS.
 [dependencies]
-rmcp = { version = "3.4.0", default-features = false, features = [
+rmcp = { version = "3.11.0", default-features = false, features = [
     "server",
     "client",
     "transport-child-process",
@@ -38,7 +38,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["s
 [dev-dependencies]
 axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }
 futures = "0.3"
-rmcp = { version = "3.4.0", default-features = false, features = [
+rmcp = { version = "3.11.0", default-features = false, features = [
     "server",
     "client",
     "transport-streamable-http-server",
