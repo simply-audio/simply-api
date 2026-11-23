@@ -239,10 +239,11 @@ impl Worker {
         match msg {
             Msg::Emit { id: event_id, event, body, created, seq } => {
                 let mut routed = vec![];
+                let mut refused = vec![];
                 for (t, _) in self.targets.iter().filter(|(t, e)| e.is_some() && t.allows(&event)) {
                     let id = uuid::Uuid::new_v4().to_string();
-                    // A sequence given up on takes nothing more: never queued, as
-                    // a body over the limit isn't, so not counted as dropped.
+                    // A sequence given up on takes nothing more: never queued,
+                    // dropped at once, for the reason the rest of it was.
                     let closed =
                         seq.as_ref().and_then(|s| self.closed.get(&(t.url.clone(), s.clone())));
                     if let Some((_, cause)) = closed {
@@ -251,6 +252,7 @@ impl Worker {
                         let state =
                             DeliveryState::Dropped { at: SystemTime::now(), attempts: 0, reason };
                         routed.push(Delivery { url: t.url.clone(), id, state });
+                        refused.push(t.url.clone());
                         continue;
                     }
                     let entry = Entry {
@@ -270,6 +272,9 @@ impl Worker {
                     self.outbox.entries.push(entry);
                 }
                 self.events().routed(&event_id, routed);
+                for url in refused {
+                    self.status_of(&url).dropped += 1;
+                }
                 let over = self.outbox.entries.len().saturating_sub(self.config.max_pending);
                 if over > 0 {
                     tracing::warn!("webhooks: outbox full, dropping the {over} oldest deliveries");

@@ -327,7 +327,9 @@ pub struct TargetStatus {
     /// In the outbox now.
     pub pending: usize,
     pub delivered: u64,
-    /// Refused for good, or given up on as too old.
+    /// Given up on, for any [`DropReason`]: an event emitted into a
+    /// sequence already given up on counts too, so every event a target
+    /// took ends delivered, dropped or still pending here.
     pub dropped: u64,
     pub last_ok: Option<SystemTime>,
     /// Why the last attempt failed (cleared by a delivery), or why the

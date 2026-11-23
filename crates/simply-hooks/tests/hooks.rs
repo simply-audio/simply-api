@@ -430,7 +430,30 @@ fn a_sequence_given_up_on_sends_nothing_more() {
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(events(&rx.got()), ["jam.shared", "jam.shared"]);
     let s = &hooks.status().targets[0];
-    assert_eq!((s.delivered, s.dropped), (1, 2), "the late one was never queued");
+    assert_eq!((s.delivered, s.dropped), (1, 3), "the late one counts as dropped too");
+}
+
+#[test]
+fn an_event_emitted_into_a_sequence_given_up_on_counts_as_dropped() {
+    let rx = Receiver::start([Answer::Refuse(401, "unauthorized")]);
+    let hooks = Hooks::new(config(None).target(Target::new(&rx.url, "k"))).unwrap();
+    hooks.emit_in("s1", "jam.shared", serde_json::json!({})).unwrap();
+    assert!(hooks.wait_idle(Duration::from_secs(10)));
+    let s = &hooks.status().targets[0];
+    assert_eq!((s.delivered, s.dropped), (0, 1), "the head was refused");
+    // The sequence is given up on before this one reaches the worker.
+    let late = hooks.emit_in("s1", "jam.ended", serde_json::json!({})).unwrap();
+    assert!(hooks.wait_idle(Duration::from_secs(10)));
+    let s = &hooks.status().targets[0];
+    assert_eq!((s.delivered, s.dropped, s.pending), (0, 2, 0), "every event has an outcome");
+    let refused = DropReason::Refused { status: 401, error: Some("unauthorized".into()) };
+    match ended(&hooks, &late) {
+        DeliveryState::Dropped { reason, attempts: 0, .. } => {
+            assert_eq!(reason, DropReason::Sequence { cause: Box::new(refused) });
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(rx.got().len(), 1, "never sent");
 }
 
 #[test]
