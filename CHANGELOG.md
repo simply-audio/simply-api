@@ -5,6 +5,16 @@ What got added, per landing — dated with a clock and the jj change id
 
 ## Unreleased
 
+#### `simply-hooks` counts every event it gives up on · 2026-11-23 20:30 · syrzkxkp
+
+- **Fixed, `simply-hooks`.** An event emitted into a sequence that was
+  already given up on now counts as dropped in the target's `dropped`
+  total, for the same reason `Hooks::deliveries` gives it ("not sent: an
+  earlier event in its sequence was …"). Before, it showed in its
+  deliveries but not in the totals, so a status could add up to fewer
+  events than were emitted. Every emitted event now ends delivered,
+  dropped or pending.
+
 #### rmcp 3.11, and MCP `2026-07-28` served and tested · 2026-11-23 20:29 · llnxnqou, otvlsmyo
 
 - **rmcp 3.11.0** in `simply-api`, `simply-relay` and `simply-relay-proxy`
