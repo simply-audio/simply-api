@@ -91,7 +91,7 @@ struct Wire {
 
 impl Wire {
     /// Serve `server` until this end is dropped.
-    fn open(server: McpApiServer<Shape>) -> Self {
+    fn open<A: Send + Sync + 'static>(server: McpApiServer<A>) -> Self {
         let (to_client, from_server) = mpsc::unbounded::<ServerJsonRpcMessage>();
         let (to_server, from_client) = mpsc::unbounded::<ClientJsonRpcMessage>();
         tokio::spawn(async move {
@@ -240,6 +240,125 @@ async fn initialize_asking_for_2026_07_28_is_answered_the_newest_handshake_revis
     );
     let listed = wire.request(tools_list(1)).await;
     assert_eq!(keys(result(&listed)), ["tools"], "the legacy envelope: {listed}");
+}
+
+// ── a tool's output, revision by revision ───────────────────────────────
+
+/// How a channel strip is routed: serializes as a bare JSON string.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum Mode {
+    Mono,
+    Stereo,
+}
+
+/// One tool per shape of result: an object, an array, a string-valued
+/// type, an `Option` of an object (an `anyOf` schema), and a plain `String`
+/// (text, by design).
+#[api_service]
+#[async_trait]
+pub trait OutputApi: Send + Sync {
+    /// An object.
+    #[api(read_only)]
+    async fn levels(&self) -> ApiResult<Levels>;
+    /// An array.
+    #[api(read_only)]
+    async fn names(&self) -> ApiResult<Vec<String>>;
+    /// A string-valued type.
+    #[api(read_only)]
+    async fn mode(&self) -> ApiResult<Mode>;
+    /// An object or nothing.
+    #[api(read_only)]
+    async fn maybe(&self) -> ApiResult<Option<Levels>>;
+    /// A plain string: text content, never structured.
+    #[api(read_only)]
+    async fn greeting(&self) -> ApiResult<String>;
+}
+
+struct Outputs;
+
+#[async_trait]
+impl OutputApi for Outputs {
+    async fn levels(&self) -> ApiResult<Levels> {
+        Ok(Levels { peaks: vec![-6.0] })
+    }
+    async fn names(&self) -> ApiResult<Vec<String>> {
+        Ok(vec!["a".into(), "b".into()])
+    }
+    async fn mode(&self) -> ApiResult<Mode> {
+        Ok(Mode::Stereo)
+    }
+    async fn maybe(&self) -> ApiResult<Option<Levels>> {
+        Ok(Some(Levels { peaks: vec![-6.0] }))
+    }
+    async fn greeting(&self) -> ApiResult<String> {
+        Ok("hello".into())
+    }
+}
+
+/// What one client sees of each tool at `revision`: the top-level `type` of
+/// its advertised output schema (`"none"` when none is advertised, `"anyOf"`
+/// for an `anyOf` root), its `structuredContent` (`"absent"` when there is
+/// none), and the text of its first content block.
+async fn outputs_seen_at(revision: &str) -> Value {
+    let server = McpApiServer::new(Arc::new(Outputs), output_api_tool_router::<Outputs>());
+    let mut wire = Wire::open(server);
+    let modern = revision == "2026-07-28";
+    let frame = |frame: Value| if modern { inline(frame) } else { frame };
+    if !modern {
+        let initialized = wire.initialize(revision).await;
+        assert_eq!(result(&initialized)["protocolVersion"], revision);
+    }
+
+    let listed = wire.request(frame(tools_list(1))).await;
+    let mut seen = serde_json::Map::new();
+    for (id, tool) in (2..).zip(result(&listed)["tools"].as_array().expect("tools")) {
+        let name = tool["name"].as_str().expect("a name");
+        let called = wire.request(frame(tools_call(id, name, json!({})))).await;
+        let called = result(&called);
+        seen.insert(
+            name.to_owned(),
+            json!({
+                "schema": match tool.get("outputSchema") {
+                    None => json!("none"),
+                    Some(schema) if schema.get("anyOf").is_some() => json!("anyOf"),
+                    Some(schema) => schema["type"].clone(),
+                },
+                "structured": called.get("structuredContent").cloned().unwrap_or(json!("absent")),
+                "text": called["content"][0]["text"],
+            }),
+        );
+    }
+    Value::Object(seen)
+}
+
+/// **Current behaviour, not a promise.** On every revision before
+/// `2026-07-28`, rmcp (3.11, `ServerResult::strip_non_object_output_for_legacy_peer`)
+/// drops an output schema whose top-level `type` is not `"object"` and a
+/// `structuredContent` that is not a JSON object; the value is still in the
+/// first text block. Those revisions allow only objects in both places.
+/// Under rmcp 3.4 (simply-api 0.3.0) both were sent to every revision.
+#[tokio::test]
+async fn a_client_before_2026_07_28_gets_non_object_results_only_as_text() {
+    let legacy = json!({
+        "levels":   {"schema": "object", "structured": {"peaks": [-6.0]}, "text": "{\"peaks\":[-6.0]}"},
+        "names":    {"schema": "none",   "structured": "absent",         "text": "[\"a\",\"b\"]"},
+        "mode":     {"schema": "none",   "structured": "absent",         "text": "\"stereo\""},
+        "maybe":    {"schema": "none",   "structured": {"peaks": [-6.0]}, "text": "{\"peaks\":[-6.0]}"},
+        "greeting": {"schema": "none",   "structured": "absent",         "text": "hello"},
+    });
+    for revision in ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"] {
+        assert_eq!(outputs_seen_at(revision).await, legacy, "at {revision}");
+    }
+
+    let modern = json!({
+        "levels":   {"schema": "object", "structured": {"peaks": [-6.0]}, "text": "{\"peaks\":[-6.0]}"},
+        "names":    {"schema": "array",  "structured": ["a", "b"],      "text": "[\"a\",\"b\"]"},
+        "mode":     {"schema": "string", "structured": "stereo",        "text": "\"stereo\""},
+        "maybe":    {"schema": "anyOf",  "structured": {"peaks": [-6.0]}, "text": "{\"peaks\":[-6.0]}"},
+        "greeting": {"schema": "none",   "structured": "absent",         "text": "hello"},
+    });
+    assert_eq!(outputs_seen_at("2026-07-28").await, modern, "at 2026-07-28");
 }
 
 // ── 2026-07-28 ──────────────────────────────────────────────────────────
