@@ -1,6 +1,6 @@
 [package]
 name = "simply-relay-proxy"
-description = "Serve the MCP servers on your own machine to Lumina over one relay connection: their tools, together, as one device"
+description = "Serve the MCP servers on your own machine to one or more Lumina Discord servers"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

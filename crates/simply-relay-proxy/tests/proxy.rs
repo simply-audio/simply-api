@@ -162,7 +162,10 @@ async fn the_proxy_dials_lumina_again_when_the_relay_drops() {
     let (hello, conn) = lumina.accept().await;
     assert!(common::relay::signed_with(&hello, common::KEY));
     let mut mcp = conn.welcome(Some("chris")).await;
-    common::relay::until(proxy.relay(), |s| matches!(s, Status::Connected { .. })).await;
+    common::relay::until(proxy.relay(common::DEVICE).unwrap(), |s| {
+        matches!(s, Status::Connected { .. })
+    })
+    .await;
     until_names(&mut mcp, &["alpha.read"]).await;
     mcp.call("alpha.read", json!({}), "?").await.unwrap();
 
@@ -189,12 +192,128 @@ async fn a_new_key_from_lumina_is_written_into_the_config() {
     assert!(std::fs::read_to_string(&path).unwrap().contains("# hand-written"));
     proxy.shutdown().await;
 
-    // Not linked: the proxy waits rather than dial.
+    // Zero linked devices: starts cleanly without crashing or dialling.
     let unlinked = dir.path().join("unlinked.toml");
     std::fs::write(&unlinked, format!("relay = \"{}\"\n", lumina.url)).unwrap();
     let proxy = simply_relay_proxy::Proxy::start(&unlinked, common::options()).unwrap();
-    common::relay::until(proxy.relay(), |s| matches!(s, Status::NotLinked)).await;
+    assert!(proxy.relays().is_empty());
     assert!(lumina.quiet_for(std::time::Duration::from_millis(200)).await);
+    proxy.shutdown().await;
+}
+
+#[tokio::test]
+async fn multiple_linked_devices_share_local_servers_with_independent_consent_and_keys() {
+    const DEV_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const KEY_A: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const DEV_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const KEY_B: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+
+    let dir = tempfile::tempdir().unwrap();
+    let lumina = FakeLumina::start().await;
+    let alpha = Local::new("alpha", vec![tool("read", true), tool("write", false)]);
+    let beta = Local::new("beta", vec![tool("status", true)]);
+    let (alpha_port, beta_port) = (free_port(), free_port());
+    let _alpha_server = HttpServer::start(&alpha, alpha_port);
+
+    let path = dir.path().join("config.toml");
+    std::fs::write(
+        &path,
+        format!(
+            "# shared config\n\
+             relay = \"{}\"\n\
+             label = \"studio-mac\"\n\n\
+             [consent]\n\
+             read_only = true\n\
+             actions = {{ alpha = true }}\n\n\
+             [servers.alpha]\n\
+             url = \"http://127.0.0.1:{alpha_port}/mcp\"\n\n\
+             [servers.beta]\n\
+             url = \"http://127.0.0.1:{beta_port}/mcp\"\n\n\
+             [[devices]]\n\
+             id = \"{DEV_A}\"\n\
+             key = \"{KEY_A}\"\n\
+             server = \"Server A\"\n\
+             member = \"alice\"\n\n\
+             [[devices]]\n\
+             id = \"{DEV_B}\"\n\
+             key = \"{KEY_B}\"\n\
+             server = \"Server B\"\n\
+             member = \"bob\"\n\
+             [devices.consent]\n\
+             actions = {{ alpha = false }}\n",
+            lumina.url
+        ),
+    )
+    .unwrap();
+
+    let proxy = simply_relay_proxy::Proxy::start(&path, common::options()).unwrap();
+    assert_eq!(proxy.relays().len(), 2);
+
+    // Both devices dial in (in any order). Re-key DEV_A in its welcome.
+    let mut mcp_a = None;
+    let mut mcp_b = None;
+    for _ in 0..2 {
+        let (hello, conn) = lumina.accept().await;
+        match hello.device_id.as_str() {
+            DEV_A => {
+                assert!(common::relay::signed_with(&hello, KEY_A));
+                assert!(hello.consent.read_only);
+                assert_eq!(hello.consent.actions.get("alpha"), Some(&true));
+                mcp_a = Some(
+                    conn.welcome_device(DEV_A, Some("alice"), Some(common::relay::NEW_KEY))
+                        .await
+                        .unwrap(),
+                );
+            }
+            DEV_B => {
+                assert!(common::relay::signed_with(&hello, KEY_B));
+                assert!(hello.consent.read_only);
+                assert_eq!(hello.consent.actions.get("alpha"), Some(&false));
+                mcp_b = Some(conn.welcome_device(DEV_B, Some("bob"), None).await.unwrap());
+            }
+            other => panic!("unexpected device_id: {other}"),
+        }
+    }
+    let mut mcp_a = mcp_a.unwrap();
+    let mut mcp_b = mcp_b.unwrap();
+
+    // Separate per-device state directories exist without clobbering each other.
+    assert!(dir.path().join("devices").join(DEV_A).join("lumina.toml").exists());
+    assert!(dir.path().join("devices").join(DEV_B).join("lumina.toml").exists());
+
+    // DEV_A sees read + write; DEV_B sees read only (alpha action overridden to false).
+    until_names(&mut mcp_a, &["alpha.read", "alpha.write"]).await;
+    until_names(&mut mcp_b, &["alpha.read"]).await;
+
+    // Both can call alpha.read on the shared local server.
+    mcp_a.call("alpha.read", json!({"from": "a"}), "check a").await.unwrap();
+    mcp_b.call("alpha.read", json!({"from": "b"}), "check b").await.unwrap();
+
+    // DEV_A can call alpha.write; DEV_B is refused by its per-device consent.
+    mcp_a.call("alpha.write", json!({"n": 1}), "write a").await.unwrap();
+    let refused = mcp_b.call("alpha.write", json!({"n": 2}), "write b").await.unwrap_err();
+    assert_eq!(refused.data, Some(json!({"refused": "switched_off", "class": "alpha"})));
+    assert_eq!(alpha.calls().len(), 3, "DEV_B's refused write never reached alpha");
+
+    // Starting beta notifies BOTH connected devices.
+    let _beta_server = HttpServer::start(&beta, beta_port);
+    tokio::time::timeout(WAIT, mcp_a.list_changed.recv()).await.unwrap().unwrap();
+    tokio::time::timeout(WAIT, mcp_b.list_changed.recv()).await.unwrap().unwrap();
+    until_names(&mut mcp_a, &["alpha.read", "alpha.write", "beta.status"]).await;
+    until_names(&mut mcp_b, &["alpha.read", "beta.status"]).await;
+
+    // Re-keying DEV_A updated ONLY DEV_A's key; DEV_B's key, metadata, and
+    // consent override remain intact.
+    let reloaded = simply_relay_proxy::Config::load(&path).unwrap();
+    assert_eq!(reloaded.find_device(DEV_A).unwrap().key, common::relay::NEW_KEY);
+    assert_eq!(reloaded.find_device(DEV_A).unwrap().server.as_deref(), Some("Server A"));
+    let dev_b = reloaded.find_device(DEV_B).unwrap();
+    assert_eq!(dev_b.key, KEY_B);
+    assert_eq!(dev_b.server.as_deref(), Some("Server B"));
+    assert_eq!(dev_b.member.as_deref(), Some("bob"));
+    assert_eq!(dev_b.consent.as_ref().unwrap().actions.get("alpha"), Some(&false));
+    assert!(std::fs::read_to_string(&path).unwrap().starts_with("# shared config\n"));
+
     proxy.shutdown().await;
 }
 

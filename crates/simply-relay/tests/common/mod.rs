@@ -231,12 +231,23 @@ impl Conn {
     /// Welcome the device, handing it `key` when given (a re-keyed device),
     /// and try to connect as Lumina's MCP client.
     pub async fn welcome_with(
+        self,
+        member: Option<&str>,
+        key: Option<&str>,
+    ) -> Result<Mcp, String> {
+        self.welcome_device(DEVICE, member, key).await
+    }
+
+    /// Welcome `device_id` as `member`, optionally handing it a new `key`, and
+    /// try to connect as Lumina's MCP client.
+    pub async fn welcome_device(
         mut self,
+        device_id: &str,
         member: Option<&str>,
         key: Option<&str>,
     ) -> Result<Mcp, String> {
         let welcome = Welcome {
-            device_id: DEVICE.into(),
+            device_id: device_id.into(),
             member: member.map(Into::into),
             key: key.map(Into::into),
         };

@@ -3,7 +3,7 @@
 //! owns the tool and its answer passed back as it came.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, Implementation, ListToolsResult,
@@ -32,7 +32,9 @@ pub struct Catalog {
     up: Mutex<BTreeMap<String, Up>>,
     /// Per server, the tools the config says are read-only.
     read_only: BTreeMap<String, BTreeSet<String>>,
-    lumina: ListChanged,
+    /// One listener per live [`Union`] connection so multiple linked devices
+    /// all receive `notifications/tools/list_changed`.
+    listeners: Mutex<Vec<Weak<ListChanged>>>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -97,9 +99,33 @@ impl Catalog {
         Some(if listed || hinted { Class::ReadOnly } else { Class::Action(server) })
     }
 
-    /// Tell a connected Lumina to list the tools again.
+    /// Register a new listener for a [`Union`] connection.
+    fn register_listener(&self) -> Arc<ListChanged> {
+        let listener = Arc::new(ListChanged::default());
+        let mut listeners = lock(&self.listeners);
+        listeners.retain(|w| w.strong_count() > 0);
+        listeners.push(Arc::downgrade(&listener));
+        listener
+    }
+
+    /// Tell every connected Lumina to list the tools again.
     fn notify(&self) {
-        self.lumina.notify(&tokio::runtime::Handle::current());
+        let handle = tokio::runtime::Handle::current();
+        let active: Vec<Arc<ListChanged>> = {
+            let mut listeners = lock(&self.listeners);
+            let mut live = Vec::with_capacity(listeners.len());
+            listeners.retain(|w| match w.upgrade() {
+                Some(lc) => {
+                    live.push(lc);
+                    true
+                }
+                None => false,
+            });
+            live
+        };
+        for listener in active {
+            listener.notify(&handle);
+        }
     }
 }
 
@@ -109,16 +135,18 @@ fn renamed(server: &str, tool: &Tool) -> Tool {
     tool
 }
 
-/// The handler served over the relay, one per Lumina connection, all on the
+/// The handler served over a relay, one per Lumina connection, all on the
 /// same [`Catalog`].
 #[derive(Clone)]
 pub struct Union {
     catalog: Arc<Catalog>,
+    lumina: Arc<ListChanged>,
 }
 
 impl Union {
     pub fn new(catalog: Arc<Catalog>) -> Self {
-        Self { catalog }
+        let lumina = catalog.register_listener();
+        Self { catalog, lumina }
     }
 }
 
@@ -165,7 +193,7 @@ impl ServerHandler for Union {
     }
 
     async fn on_initialized(&self, context: NotificationContext<RoleServer>) {
-        self.catalog.lumina.set_session(Some(context.peer));
+        self.lumina.set_session(Some(context.peer));
     }
 
     /// A `2026-07-28` Lumina has no session to be told on: it listens here.
@@ -177,9 +205,9 @@ impl ServerHandler for Union {
     }
 
     async fn listen(&self, subscription: SubscriptionContext) -> Result<(), ErrorData> {
-        let key = self.catalog.lumina.subscribe(subscription.sink().clone());
+        let key = self.lumina.subscribe(subscription.sink().clone());
         subscription.cancelled().await;
-        self.catalog.lumina.unsubscribe(key);
+        self.lumina.unsubscribe(key);
         Ok(())
     }
 }

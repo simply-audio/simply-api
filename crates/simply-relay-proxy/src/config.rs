@@ -1,4 +1,4 @@
-//! The config file: where Lumina is, the device's key, the switches and the
+//! The config file: where Lumina is, the linked devices, the switches and the
 //! local MCP servers.
 //!
 //! ```toml
@@ -16,13 +16,19 @@
 //! command = ["notes-mcp", "--stdio"]
 //! read_only = ["search"]           # read-only even if the server doesn't say
 //!
-//! [device]                         # written by `simply-relay-proxy pair`
+//! [[devices]]                      # written by `simply-relay-proxy pair`
 //! id = "0123456789abcdef0123456789abcdef"
 //! key = "…"
+//! server = "Studio Discord"
+//! member = "chris"
+//!
+//! [devices.consent]                # optional per-device override of [consent]
+//! actions = { tussen = false }
 //! ```
 //!
-//! The file holds the device key, so the proxy writes it readable by its
-//! owner only.
+//! The legacy single `[device]` table is still accepted alongside `[[devices]]`.
+//! The file holds device keys, so the proxy writes it readable by its owner
+//! only.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -47,15 +53,18 @@ pub struct Config {
     /// What Lumina shows this machine as. Default: the host name.
     #[serde(default)]
     pub label: Option<String>,
-    /// The switches; all off by default.
+    /// The shared default switches; all off by default.
     #[serde(default)]
     pub consent: Consent,
     /// The local MCP servers, by name.
     #[serde(default)]
     pub servers: BTreeMap<String, Server>,
-    /// The device's id and key, written by `pair`.
+    /// Legacy single-device `[device]` table; kept for backwards compatibility.
     #[serde(default)]
     pub device: Option<Device>,
+    /// Linked devices (`[[devices]]`), written by `pair`.
+    #[serde(default)]
+    pub devices: Vec<Device>,
 }
 
 fn default_relay() -> String {
@@ -96,23 +105,90 @@ impl Server {
     }
 }
 
-/// The `[device]` table.
+/// Per-device override overlaid onto the top-level `[consent]`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConsentOverride {
+    /// Override top-level `consent.read_only` when set.
+    #[serde(default)]
+    pub read_only: Option<bool>,
+    /// Per-server action switches overlaid onto top-level `consent.actions`.
+    #[serde(default)]
+    pub actions: BTreeMap<String, bool>,
+}
+
+impl ConsentOverride {
+    /// Overlay this override onto `base`, returning the effective switches.
+    pub fn apply(&self, base: &Consent) -> Consent {
+        let mut merged = base.clone();
+        if let Some(read_only) = self.read_only {
+            merged.read_only = read_only;
+        }
+        for (class, on) in &self.actions {
+            merged.actions.insert(class.clone(), *on);
+        }
+        merged
+    }
+
+    /// True when no field overrides the top-level `[consent]`.
+    pub fn is_empty(&self) -> bool {
+        self.read_only.is_none() && self.actions.is_empty()
+    }
+}
+
+/// One linked device (`[[devices]]`, or the legacy `[device]` table).
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Device {
     pub id: String,
     pub key: String,
+    /// The Discord server name recorded when pairing.
+    #[serde(default)]
+    pub server: Option<String>,
+    /// The member name recorded when pairing.
+    #[serde(default)]
+    pub member: Option<String>,
+    /// Optional per-device consent override.
+    #[serde(default)]
+    pub consent: Option<ConsentOverride>,
 }
 
 impl std::fmt::Debug for Device {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Device").field("id", &self.id).finish_non_exhaustive()
+        f.debug_struct("Device")
+            .field("id", &self.id)
+            .field("server", &self.server)
+            .field("member", &self.member)
+            .field("consent", &self.consent)
+            .finish_non_exhaustive()
     }
 }
 
 impl Device {
     pub fn key(&self) -> DeviceKey {
         DeviceKey { device_id: self.id.clone(), key: Secret::new(&self.key) }
+    }
+
+    /// Effective consent switches for this device: top-level `base` with any
+    /// per-device override overlaid.
+    pub fn effective_consent(&self, base: &Consent) -> Consent {
+        match &self.consent {
+            Some(override_consent) => override_consent.apply(base),
+            None => base.clone(),
+        }
+    }
+
+    /// First 8 characters of the device id, for compact display.
+    pub fn short_id(&self) -> &str {
+        match self.id.char_indices().nth(8) {
+            Some((idx, _)) => &self.id[..idx],
+            None => &self.id,
+        }
+    }
+
+    /// Server name if known, otherwise the short device id.
+    pub fn display_name(&self) -> &str {
+        self.server.as_deref().filter(|s| !s.is_empty()).unwrap_or_else(|| self.short_id())
     }
 }
 
@@ -133,8 +209,20 @@ impl Config {
         Ok(config)
     }
 
+    /// All linked devices: the legacy `[device]` (if present) followed by
+    /// every `[[devices]]` entry.
+    pub fn all_devices(&self) -> Vec<&Device> {
+        self.device.iter().chain(self.devices.iter()).collect()
+    }
+
+    /// Look up a linked device by exact `id`.
+    pub fn find_device(&self, id: &str) -> Option<&Device> {
+        self.all_devices().into_iter().find(|d| d.id == id)
+    }
+
     /// Server names become the first part of every tool name and the name
-    /// of their action switch.
+    /// of their action switch. Device ids must be non-empty, safe as a
+    /// directory name, and unique across `[device]` and `[[devices]]`.
     fn check(&self) -> Result<(), String> {
         for (name, server) in &self.servers {
             if name.is_empty() || name.contains('.') || name == "read_only" {
@@ -144,25 +232,190 @@ impl Config {
             }
             server.transport().map_err(|e| format!("[servers.{name}] {e}"))?;
         }
+        let mut seen = BTreeSet::new();
+        for device in self.all_devices() {
+            if device.id.is_empty()
+                || device.id == "."
+                || device.id == ".."
+                || device.id.contains('/')
+                || device.id.contains('\\')
+            {
+                return Err(format!("invalid device id {:?}", device.id));
+            }
+            if !seen.insert(&device.id) {
+                return Err(format!("duplicate device id {:?}", device.id));
+            }
+        }
         Ok(())
     }
 }
 
-/// Write `device` into the `[device]` table of the file at `path`, keeping
-/// everything else in it as it was; the file ends up readable by its owner
-/// only.
+/// Why resolving or removing a device failed.
+#[derive(Debug)]
+pub enum RemoveError {
+    Io(io::Error),
+    /// No device matched `target` by id or server name.
+    NotFound(String),
+    /// More than one device matched `target` by server name.
+    Ambiguous {
+        target: String,
+        matches: Vec<String>,
+    },
+}
+
+impl std::fmt::Display for RemoveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RemoveError::Io(e) => write!(f, "{e}"),
+            RemoveError::NotFound(target) => write!(f, "no linked device matches {target:?}"),
+            RemoveError::Ambiguous { target, matches } => write!(
+                f,
+                "more than one device matches server {target:?} ({}); pass the device id instead",
+                matches.join(", ")
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RemoveError {}
+
+impl From<io::Error> for RemoveError {
+    fn from(e: io::Error) -> Self {
+        RemoveError::Io(e)
+    }
+}
+
+/// Resolve `target` against `config`: exact `id` match first, then
+/// case-insensitive `server` match.
+pub fn resolve_device<'a>(config: &'a Config, target: &str) -> Result<&'a Device, RemoveError> {
+    if let Some(device) = config.find_device(target) {
+        return Ok(device);
+    }
+    let matches: Vec<&Device> = config
+        .all_devices()
+        .into_iter()
+        .filter(|d| d.server.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(target)))
+        .collect();
+    match matches.as_slice() {
+        [] => Err(RemoveError::NotFound(target.to_owned())),
+        [only] => Ok(*only),
+        many => Err(RemoveError::Ambiguous {
+            target: target.to_owned(),
+            matches: many.iter().map(|d| d.id.clone()).collect(),
+        }),
+    }
+}
+
+/// Update `device`'s key in place if its `device_id` already exists (in
+/// `[device]` or `[[devices]]`), or append a new `[[devices]]` entry,
+/// keeping every other device and the rest of the file intact; the file ends
+/// up readable by its owner only.
 pub fn store_device(path: &Path, device: &DeviceKey) -> io::Result<()> {
+    store_linked_device(path, device, None, None)
+}
+
+/// Like [`store_device`], also recording optional `server` and `member`
+/// display metadata (when non-empty).
+pub fn store_linked_device(
+    path: &Path,
+    device: &DeviceKey,
+    server: Option<&str>,
+    member: Option<&str>,
+) -> io::Result<()> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e),
     };
     let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e| invalid(path, e))?;
-    let mut table = toml_edit::Table::new();
-    table["id"] = toml_edit::value(device.device_id.clone());
-    table["key"] = toml_edit::value(device.key.expose());
-    doc["device"] = toml_edit::Item::Table(table);
+    let server = server.filter(|s| !s.is_empty());
+    let member = member.filter(|m| !m.is_empty());
+
+    let apply = |table: &mut toml_edit::Table| {
+        table["id"] = toml_edit::value(device.device_id.clone());
+        table["key"] = toml_edit::value(device.key.expose());
+        if let Some(s) = server {
+            table["server"] = toml_edit::value(s);
+        }
+        if let Some(m) = member {
+            table["member"] = toml_edit::value(m);
+        }
+    };
+
+    // 1. Update legacy `[device]` in place if it has the same id.
+    let updated_legacy = doc
+        .get_mut("device")
+        .and_then(|item| item.as_table_mut())
+        .filter(|table| table.get("id").and_then(|v| v.as_str()) == Some(device.device_id.as_str()))
+        .map(|table| {
+            apply(table);
+        })
+        .is_some();
+
+    // 2. Otherwise update matching `[[devices]]` entry in place, or append one.
+    if !updated_legacy {
+        let mut updated_entry = false;
+        if let Some(aot) = doc.get_mut("devices").and_then(|item| item.as_array_of_tables_mut()) {
+            for table in aot.iter_mut() {
+                if table.get("id").and_then(|v| v.as_str()) == Some(device.device_id.as_str()) {
+                    apply(table);
+                    updated_entry = true;
+                    break;
+                }
+            }
+            if !updated_entry {
+                let mut table = toml_edit::Table::new();
+                apply(&mut table);
+                aot.push(table);
+                updated_entry = true;
+            }
+        }
+        if !updated_entry {
+            let mut aot = toml_edit::ArrayOfTables::new();
+            let mut table = toml_edit::Table::new();
+            apply(&mut table);
+            aot.push(table);
+            doc["devices"] = toml_edit::Item::ArrayOfTables(aot);
+        }
+    }
+
     write_private(path, doc.to_string().as_bytes())
+}
+
+/// Remove the device matching `target` (exact id or unique server name) from
+/// the file at `path`, keeping all other devices and the rest of the file
+/// intact. Returns the removed device.
+pub fn remove_device(path: &Path, target: &str) -> Result<Device, RemoveError> {
+    let config = Config::load(path)?;
+    let removed = resolve_device(&config, target)?.clone();
+
+    let text = std::fs::read_to_string(path)?;
+    let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e| invalid(path, e))?;
+
+    let is_legacy = doc
+        .get("device")
+        .and_then(|item| item.as_table())
+        .and_then(|table| table.get("id"))
+        .and_then(|v| v.as_str())
+        == Some(removed.id.as_str());
+
+    if is_legacy {
+        doc.remove("device");
+    } else if let Some(aot) = doc.get_mut("devices").and_then(|item| item.as_array_of_tables_mut())
+    {
+        let pos = aot.iter().position(|table| {
+            table.get("id").and_then(|v| v.as_str()) == Some(removed.id.as_str())
+        });
+        if let Some(pos) = pos {
+            aot.remove(pos);
+        }
+        if aot.is_empty() {
+            doc.remove("devices");
+        }
+    }
+
+    write_private(path, doc.to_string().as_bytes())?;
+    Ok(removed)
 }
 
 /// Replace `path` with `bytes`: a 0600 temporary file renamed over it.
@@ -291,7 +544,8 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.starts_with("# my servers\n"), "{text}");
         let config = Config::load(&path).unwrap();
-        assert_eq!(config.device.unwrap().key, "cd");
+        assert_eq!(config.devices.len(), 1);
+        assert_eq!(config.devices[0].key, "cd");
         assert!(config.servers.contains_key("tussen"));
         #[cfg(unix)]
         {
@@ -299,6 +553,180 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
         }
+    }
+
+    #[test]
+    fn multi_device_loading_and_legacy_compat() {
+        let config: Config = toml::from_str(
+            r#"
+            [consent]
+            read_only = true
+            actions = { tussen = true, flux = false }
+
+            [device]
+            id = "aaaa"
+            key = "k1"
+
+            [[devices]]
+            id = "bbbb"
+            key = "k2"
+            server = "Band Server"
+            member = "chris"
+
+            [devices.consent]
+            actions = { tussen = false, flux = true }
+
+            [[devices]]
+            id = "cccc"
+            key = "k3"
+            server = "Studio"
+
+            [devices.consent]
+            read_only = false
+            "#,
+        )
+        .unwrap();
+        config.check().unwrap();
+        let all = config.all_devices();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].id, "aaaa");
+        assert_eq!(all[1].id, "bbbb");
+        assert_eq!(all[2].id, "cccc");
+
+        // Legacy [device] inherits top-level [consent].
+        let c0 = all[0].effective_consent(&config.consent);
+        assert!(c0.read_only);
+        assert_eq!(c0.actions.get("tussen"), Some(&true));
+        assert_eq!(c0.actions.get("flux"), Some(&false));
+
+        // Second device overrides actions only; read_only stays true.
+        let c1 = all[1].effective_consent(&config.consent);
+        assert!(c1.read_only);
+        assert_eq!(c1.actions.get("tussen"), Some(&false));
+        assert_eq!(c1.actions.get("flux"), Some(&true));
+
+        // Third device overrides read_only only; actions stay inherited.
+        let c2 = all[2].effective_consent(&config.consent);
+        assert!(!c2.read_only);
+        assert_eq!(c2.actions.get("tussen"), Some(&true));
+        assert_eq!(c2.actions.get("flux"), Some(&false));
+
+        // Debug never leaks keys.
+        let dbg = format!("{:?}", all);
+        assert!(!dbg.contains("k1") && !dbg.contains("k2") && !dbg.contains("k3"));
+    }
+
+    #[test]
+    fn duplicate_and_invalid_device_ids_are_rejected() {
+        for bad in [
+            // Duplicate between [device] and [[devices]].
+            "[device]\nid = \"dup\"\nkey = \"1\"\n[[devices]]\nid = \"dup\"\nkey = \"2\"\n",
+            // Duplicate within [[devices]].
+            "[[devices]]\nid = \"dup\"\nkey = \"1\"\n[[devices]]\nid = \"dup\"\nkey = \"2\"\n",
+            // Empty or path-unsafe ids.
+            "[[devices]]\nid = \"\"\nkey = \"1\"\n",
+            "[[devices]]\nid = \"../escape\"\nkey = \"1\"\n",
+            "[[devices]]\nid = \"a/b\"\nkey = \"1\"\n",
+        ] {
+            let config: Config = toml::from_str(bad).unwrap();
+            assert!(config.check().is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn store_preserves_legacy_device_and_consent_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "# keep me\n\
+             [consent]\nread_only = true\n\n\
+             [device]\nid = \"legacy1\"\nkey = \"old_legacy\"\n\n\
+             [[devices]]\nid = \"dev2\"\nkey = \"old_dev2\"\nserver = \"Alpha\"\nmember = \"alice\"\n\
+             [devices.consent]\nread_only = false\nactions = { tussen = true }\n",
+        )
+        .unwrap();
+
+        // Pairing a third device appends [[devices]] without losing [device] or dev2.
+        let dev3 = DeviceKey { device_id: "dev3".into(), key: Secret::new("key3") };
+        store_linked_device(&path, &dev3, Some("Beta"), Some("bob")).unwrap();
+
+        // Re-keying legacy [device] updates it in place without touching [[devices]].
+        let legacy_new = DeviceKey { device_id: "legacy1".into(), key: Secret::new("new_legacy") };
+        store_device(&path, &legacy_new).unwrap();
+
+        // Re-keying dev2 updates only its key, preserving server, member, and [devices.consent].
+        let dev2_new = DeviceKey { device_id: "dev2".into(), key: Secret::new("new_dev2") };
+        store_device(&path, &dev2_new).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("# keep me\n"), "{text}");
+        let config = Config::load(&path).unwrap();
+        assert_eq!(config.device.as_ref().unwrap().id, "legacy1");
+        assert_eq!(config.device.as_ref().unwrap().key, "new_legacy");
+        assert_eq!(config.devices.len(), 2);
+        assert_eq!(config.devices[0].id, "dev2");
+        assert_eq!(config.devices[0].key, "new_dev2");
+        assert_eq!(config.devices[0].server.as_deref(), Some("Alpha"));
+        assert_eq!(config.devices[0].member.as_deref(), Some("alice"));
+        let consent = config.devices[0].consent.as_ref().unwrap();
+        assert_eq!(consent.read_only, Some(false));
+        assert_eq!(consent.actions.get("tussen"), Some(&true));
+        assert_eq!(config.devices[1].id, "dev3");
+        assert_eq!(config.devices[1].key, "key3");
+        assert_eq!(config.devices[1].server.as_deref(), Some("Beta"));
+        assert_eq!(config.devices[1].member.as_deref(), Some("bob"));
+    }
+
+    #[test]
+    fn remove_device_by_id_or_server_and_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "# keep comment\n\
+             [servers.tussen]\nurl = \"http://127.0.0.1:9097/mcp\"\n\n\
+             [device]\nid = \"legacy1\"\nkey = \"k0\"\nserver = \"Old\"\n\n\
+             [[devices]]\nid = \"d1\"\nkey = \"k1\"\nserver = \"Shared\"\n\
+             [devices.consent]\nread_only = false\n\n\
+             [[devices]]\nid = \"d2\"\nkey = \"k2\"\nserver = \"Shared\"\n\n\
+             [[devices]]\nid = \"d3\"\nkey = \"k3\"\nserver = \"Unique\"\n",
+        )
+        .unwrap();
+
+        // Unknown target -> NotFound.
+        assert!(matches!(remove_device(&path, "nope"), Err(RemoveError::NotFound(_))));
+
+        // Ambiguous server name -> Ambiguous with both ids.
+        match remove_device(&path, "Shared") {
+            Err(RemoveError::Ambiguous { matches, .. }) => assert_eq!(matches, ["d1", "d2"]),
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
+
+        // Remove unique server name (case-insensitive).
+        let removed = remove_device(&path, "unique").unwrap();
+        assert_eq!(removed.id, "d3");
+
+        // Remove one of the ambiguous ones by exact id.
+        let removed = remove_device(&path, "d1").unwrap();
+        assert_eq!(removed.id, "d1");
+
+        // Now "Shared" is unique and works by server name.
+        let removed = remove_device(&path, "Shared").unwrap();
+        assert_eq!(removed.id, "d2");
+
+        // Legacy [device] is still there; remove it by id.
+        let config = Config::load(&path).unwrap();
+        assert_eq!(config.all_devices().len(), 1);
+        assert_eq!(config.device.as_ref().unwrap().id, "legacy1");
+        assert!(config.devices.is_empty());
+
+        let removed = remove_device(&path, "legacy1").unwrap();
+        assert_eq!(removed.id, "legacy1");
+
+        let config = Config::load(&path).unwrap();
+        assert!(config.all_devices().is_empty());
+        assert!(std::fs::read_to_string(&path).unwrap().starts_with("# keep comment\n"));
     }
 
     #[test]
