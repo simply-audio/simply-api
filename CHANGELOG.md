@@ -3,6 +3,12 @@
 What got added, per landing — dated with a clock and the jj change id
 (one entry per landing, newest first).
 
+## Unreleased
+
+#### One `simply-relay-proxy` can now link to multiple Lumina Discord servers · 2026-11-25 18:39 · mqnuynzm
+
+You can now run `simply-relay-proxy pair CODE` for as many Discord servers as you like from the same proxy process, each with its own individually revocable device key in `[[devices]]` (existing `[device]` configs keep working unchanged). Each server shares your local MCP servers and inherits top-level `[consent]` by default, with optional per-device `[devices.consent]` overrides for `read_only` or individual `actions`. Added `simply-relay-proxy devices` to list linked servers and `simply-relay-proxy unpair <id-or-server>` to unlink and remove one.
+
 ## 0.4.0 — 2026-11-23
 
 #### `simply-hooks` counts every event it gives up on · 2026-11-23 20:30 · syrzkxkp
