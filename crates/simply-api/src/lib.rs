@@ -10,8 +10,11 @@
 //!   schema from the return type; `#[api(no_tool)]` opts a method out;
 //! - a **dispatcher** (`{Trait}Dispatcher`) and a **typed remote client**
 //!   (`Remote{Trait}` over any [`Caller`]) — the seam a real remote
-//!   transport plugs into; in-process callers just use `Arc<dyn Trait>`
-//!   (`Dyn{Trait}`) directly;
+//!   transport plugs into;
+//! - a **typed in-process client** (`Local{Trait}` over any
+//!   `{Trait}TypedCaller`) — passes `{Base}Request` / `{Base}Response`
+//!   directly with zero serde (for middleware, channels, or dispatch hooks),
+//!   while direct in-process callers can use `Arc<dyn Trait>` (`Dyn{Trait}`);
 //! - a **method registry** (`{TRAIT}_META`) for lint tests and doc
 //!   generation.
 //!

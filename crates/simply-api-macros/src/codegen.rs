@@ -10,7 +10,10 @@
 //! 4. `{Trait}Dispatcher` — name+JSON dispatch onto any implementor (the
 //!    server half of a remote transport, and the loopback for tests);
 //! 5. `Remote{Trait}` — implements the trait over any `simply_api::Caller`
-//!    (the seam a real remote transport plugs into later).
+//!    (the seam a real remote transport plugs into later);
+//! 6. `{Trait}TypedCaller` and `Local{Trait}` — implements the trait over
+//!    any typed in-process caller (`{Base}Request` → `{Base}Response`),
+//!    with zero serde on the call path.
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
@@ -29,6 +32,7 @@ pub fn generate(parsed: &ParsedTrait, vis: &syn::Visibility) -> TokenStream {
     let router = router_fn(parsed, vis, &trait_snake);
     let dispatcher = dispatcher(parsed, vis);
     let remote = remote_client(parsed, vis);
+    let local = local_client(parsed, vis);
 
     let dyn_alias = format_ident!("Dyn{}", trait_ident);
     let dyn_doc = format!("A shared, dynamically-typed `{trait_ident}` — the in-process client.");
@@ -42,6 +46,7 @@ pub fn generate(parsed: &ParsedTrait, vis: &syn::Visibility) -> TokenStream {
         #router
         #dispatcher
         #remote
+        #local
 
         #[doc = #dyn_doc]
         #vis type #dyn_alias = ::std::sync::Arc<dyn #trait_ident>;
@@ -555,6 +560,66 @@ fn remote_client(parsed: &ParsedTrait, vis: &syn::Visibility) -> TokenStream {
 
         #[::simply_api::export::async_trait::async_trait]
         impl<C: ::simply_api::Caller> #trait_ident for #remote_ident<C> {
+            #(#methods)*
+        }
+    }
+}
+
+fn local_client(parsed: &ParsedTrait, vis: &syn::Visibility) -> TokenStream {
+    let trait_ident = &parsed.ident;
+    let typed_caller_ident = format_ident!("{}TypedCaller", trait_ident);
+    let local_ident = format_ident!("Local{}", trait_ident);
+    let request = request_ident(parsed);
+    let response = response_ident(parsed);
+
+    let caller_doc = format!(
+        "Typed in-process invocation seam for [`{trait_ident}`]: takes [`{request}`] \
+         and returns [`{response}`] without JSON serialization."
+    );
+    let local_doc = format!(
+        "Implements [`{trait_ident}`] over any [`{typed_caller_ident}`]: a typed \
+         in-process client that passes [`{request}`] / [`{response}`] directly \
+         with zero serde."
+    );
+
+    let methods = parsed.methods.iter().map(|m| {
+        let sig = &m.sig;
+        let variant = &m.variant;
+        let wire_name = &m.wire_name;
+        let fields: Vec<_> = m.params.iter().map(|p| &p.name).collect();
+        let ok_arm = match m.output {
+            OutputKind::Unit => quote!(#response::#variant => ::std::result::Result::Ok(())),
+            _ => quote!(#response::#variant(v) => ::std::result::Result::Ok(v)),
+        };
+        quote! {
+            #sig {
+                let request = #request::#variant { #(#fields),* };
+                match #typed_caller_ident::call(&self.0, request).await? {
+                    #ok_arm,
+                    #[allow(unreachable_patterns)]
+                    other => ::std::result::Result::Err(::simply_api::ApiError::failed(
+                        ::std::format!(
+                            "{}: unexpected response variant {other:?}",
+                            #wire_name,
+                        ),
+                    )),
+                }
+            }
+        }
+    });
+
+    quote! {
+        #[doc = #caller_doc]
+        #[::simply_api::export::async_trait::async_trait]
+        #vis trait #typed_caller_ident: ::std::marker::Send + ::std::marker::Sync {
+            async fn call(&self, request: #request) -> ::simply_api::ApiResult<#response>;
+        }
+
+        #[doc = #local_doc]
+        #vis struct #local_ident<C>(pub C);
+
+        #[::simply_api::export::async_trait::async_trait]
+        impl<C: #typed_caller_ident> #trait_ident for #local_ident<C> {
             #(#methods)*
         }
     }

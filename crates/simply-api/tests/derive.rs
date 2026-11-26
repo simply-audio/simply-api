@@ -347,3 +347,130 @@ fn request_schema_documents_every_variant() {
     let one_of = schema["oneOf"].as_array().expect("externally tagged enum schema");
     assert_eq!(one_of.len(), INVENTORY_API_META.methods.len(), "a variant per method");
 }
+
+// ── typed local client ──────────────────────────────────────────────────
+
+struct DirectInventoryCaller(Inventory);
+
+#[async_trait]
+impl InventoryApiTypedCaller for DirectInventoryCaller {
+    async fn call(&self, request: InventoryRequest) -> ApiResult<InventoryResponse> {
+        request.dispatch(&self.0).await
+    }
+}
+
+#[tokio::test]
+async fn local_client_round_trips_typed_requests() {
+    let api = LocalInventoryApi(DirectInventoryCaller(Inventory::default()));
+
+    // Struct return + optional param.
+    let stored = api.add("plumbus".into(), Some(3)).await.unwrap();
+    assert_eq!(stored, Item { name: "plumbus".into(), count: 3 });
+    api.add("gizmo".into(), None).await.unwrap();
+
+    // Scalar, vec, and string returns (including `#[api(name = ...)]`).
+    assert_eq!(api.count().await.unwrap(), 2);
+    assert_eq!(api.list().await.unwrap().len(), 2);
+    assert_eq!(api.remove("gizmo".into()).await.unwrap(), "removed gizmo");
+
+    // Errors propagate with kind and message intact.
+    let e = api.remove("gizmo".into()).await.unwrap_err();
+    assert_eq!(e.kind, ApiErrorKind::Failed);
+    assert_eq!(e.message, "no item named \"gizmo\"");
+    let e = api.preview().await.unwrap_err();
+    assert_eq!(e.kind, ApiErrorKind::NotSupported);
+
+    // `#[api(no_tool)]` + unit return `ApiResult<()>`.
+    api.wipe().await.unwrap();
+    assert_eq!(api.count().await.unwrap(), 0);
+}
+
+#[derive(Debug, Clone, PartialEq, JsonSchema)]
+pub struct NoSerde(pub u64);
+
+impl Serialize for NoSerde {
+    fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+        panic!("serde must not be called");
+    }
+}
+
+impl<'de> Deserialize<'de> for NoSerde {
+    fn deserialize<D: serde::Deserializer<'de>>(_: D) -> Result<Self, D::Error> {
+        panic!("serde must not be called");
+    }
+}
+
+/// Service whose parameter and return types panic if serde is ever invoked.
+#[api_service]
+#[async_trait]
+pub trait ZeroSerdeApi: Send + Sync {
+    /// Echo a value without serializing it.
+    async fn echo(
+        &self,
+        /// Payload to echo back.
+        value: NoSerde,
+    ) -> ApiResult<NoSerde>;
+
+    /// Accept a value and return unit without serializing it.
+    async fn sink(
+        &self,
+        /// Payload to consume.
+        value: NoSerde,
+    ) -> ApiResult<()>;
+}
+
+struct ZeroSerdeService;
+
+#[async_trait]
+impl ZeroSerdeApi for ZeroSerdeService {
+    async fn echo(&self, value: NoSerde) -> ApiResult<NoSerde> {
+        Ok(value)
+    }
+
+    async fn sink(&self, _value: NoSerde) -> ApiResult<()> {
+        Ok(())
+    }
+}
+
+struct ZeroSerdeCaller(ZeroSerdeService);
+
+#[async_trait]
+impl ZeroSerdeApiTypedCaller for ZeroSerdeCaller {
+    async fn call(&self, request: ZeroSerdeRequest) -> ApiResult<ZeroSerdeResponse> {
+        request.dispatch(&self.0).await
+    }
+}
+
+#[tokio::test]
+async fn local_client_never_invokes_serde() {
+    let api = LocalZeroSerdeApi(ZeroSerdeCaller(ZeroSerdeService));
+    assert_eq!(api.echo(NoSerde(42)).await.unwrap(), NoSerde(42));
+    api.sink(NoSerde(7)).await.unwrap();
+}
+
+struct WrongVariantCaller;
+
+#[async_trait]
+impl InventoryApiTypedCaller for WrongVariantCaller {
+    async fn call(&self, request: InventoryRequest) -> ApiResult<InventoryResponse> {
+        match request {
+            InventoryRequest::Wipe {} => Ok(InventoryResponse::CountItems(0)),
+            _ => Ok(InventoryResponse::Wipe),
+        }
+    }
+}
+
+#[tokio::test]
+async fn local_client_rejects_mismatched_response_variant() {
+    let api = LocalInventoryApi(WrongVariantCaller);
+
+    let err = api.count().await.unwrap_err();
+    assert_eq!(err.kind, ApiErrorKind::Failed);
+    assert!(err.message.contains("count_items"), "{err}");
+    assert!(err.message.contains("unexpected response variant"), "{err}");
+
+    let err = api.wipe().await.unwrap_err();
+    assert_eq!(err.kind, ApiErrorKind::Failed);
+    assert!(err.message.contains("wipe"), "{err}");
+    assert!(err.message.contains("unexpected response variant"), "{err}");
+}

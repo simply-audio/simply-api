@@ -5,7 +5,8 @@ One async trait → every surface derived.
 `#[api_service]` on an `#[async_trait]` trait derives, with zero marginal work per capability:
 
 * an **MCP tool router** (rmcp 3.x): each method is a tool — name from the method (or `#[api(name = "...")]`), description from its doc comment, input schema from a generated per-method params struct (schemars; parameter doc comments become field descriptions), output schema from the return type; `#[api(no_tool)]` opts a method out; `#[api(read_only)]` marks a method that only reads, and `{TRAIT}_META.read_only_tools()` lists them (an unmarked method is not read-only);
-* a **dispatcher** (`{Trait}Dispatcher`) and a **typed remote client** (`Remote{Trait}` over any [`Caller`]) — the seam a real remote transport plugs into; in-process callers just use `Arc<dyn Trait>` (`Dyn{Trait}`) directly;
+* a **dispatcher** (`{Trait}Dispatcher`) and a **typed remote client** (`Remote{Trait}` over any [`Caller`]) — the seam a real remote transport plugs into;
+* a **typed in-process client** (`Local{Trait}` over any `{Trait}TypedCaller`) — passes `{Base}Request` / `{Base}Response` directly with zero serde, while direct in-process callers can use `Arc<dyn Trait>` (`Dyn{Trait}`);
 * a **method registry** (`{TRAIT}_META`) for lint tests and doc generation.
 
 The pattern is ported from lumina's `simply-rpc` (`#[rpc_service]`) and its daemon `#[skill_router]`; HTTP/REST route generation is deliberately omitted for now.
@@ -26,7 +27,7 @@ pub trait CounterApi: Send + Sync {
 }
 ```
 
-This generates `CounterRequest`/`CounterResponse`, a `CounterApiDispatcher` (`Caller`), a `RemoteCounterApi` client and `counter_api_tool_router::<A>()`. Pass the router to `simply_api::mcp::McpApiServer::new(api, router)` and serve it over any rmcp transport. The consumer also depends on `async-trait`, `serde` and `schemars` for its own types. `tests/derive.rs` is the worked example.
+This generates `CounterRequest`/`CounterResponse`, a `CounterApiDispatcher` (`Caller`), a `RemoteCounterApi` client, a `CounterApiTypedCaller` / `LocalCounterApi` typed in-process client, and `counter_api_tool_router::<A>()`. Pass the router to `simply_api::mcp::McpApiServer::new(api, router)` and serve it over any rmcp transport. The consumer also depends on `async-trait`, `serde` and `schemars` for its own types. `tests/derive.rs` is the worked example.
 
 ## What it provides
 
